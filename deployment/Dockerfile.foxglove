@@ -1,0 +1,15 @@
+# Foxglove WebSocket bridge for live monitoring and debugging.
+FROM ros:jazzy-ros-base
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ros-jazzy-foxglove-bridge \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app/backseat_ws
+
+# The interface package is needed so the bridge can advertise core_interfaces
+# topics with their real schemas instead of dropping them as unknown types.
+COPY src/interfaces/core_interfaces/ src/interfaces/core_interfaces/
+RUN /bin/bash -c "source /opt/ros/jazzy/setup.bash && colcon build"
+
+CMD ["/bin/bash", "-c", "source /opt/ros/jazzy/setup.bash && source install/setup.bash && ros2 run foxglove_bridge foxglove_bridge --ros-args -p port:=8765"]

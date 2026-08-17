@@ -1,0 +1,30 @@
+# Simulated frontseat. Layered on top of docker-compose.yml:
+#
+#   docker compose -f deployment/docker-compose.yml \
+#                  -f deployment/docker-compose.sitl.yml up -d --build
+#
+# Adds an ArduPilot SITL container and repoints the gateway at port 14552.
+# That port change is a safety measure, not a detail: a real BlueOS frontseat
+# broadcasts to 14550, so a gateway listening on 14552 cannot latch onto a
+# physical vehicle that happens to be powered on nearby.
+
+services:
+  sitl:
+    image: blueboat-sitl
+    build:
+      context: ../
+      dockerfile: deployment/Dockerfile.sitl
+    container_name: core_sitl
+    network_mode: "host"
+    restart: no
+    environment:
+      # Simulated start position: lat,lon,alt,heading.
+      - SITL_HOME=${SITL_HOME:-41.362628,2.186193,0,0}
+      - SITL_BACKSEAT_ENDPOINT=udpclient:127.0.0.1:14552
+
+  gateway:
+    environment:
+      # Listen on the simulation port instead of the BlueOS default.
+      - MAVLINK_PORT=14552
+    depends_on:
+      - sitl

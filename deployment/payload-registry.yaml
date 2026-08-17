@@ -1,0 +1,21 @@
+# Payload registry — where scripts/sync-payloads.sh fetches payloads from.
+#
+# Each payload lives in its own repository, generated from
+# https://github.com/BlueLab-ICM/blueboat-payload-template, and is cloned into
+# src/payloads/<name>/ then built as an independent container. Nothing here is
+# required to run the core stack: an empty registry is a valid configuration.
+#
+# `repo` accepts any git URL. Private repositories are usually addressed
+# through a per-payload SSH host alias created by scripts/register-payload.sh,
+# which scopes a deploy key to a single repository:
+#
+#   repo: git@github-<name>:<org>/<name>.git
+#
+# `version` is any git ref — a branch for active development, or a tag or
+# commit SHA to pin a payload to a known-good build for a field campaign.
+
+payloads: []
+  # - name: computer-vision-perception
+  #   repo: https://github.com/<org>/computer-vision-perception.git
+  #   version: main
+  #   enabled: true

@@ -1,0 +1,132 @@
+---
+title: "Messages and services"
+description: "The one custom message, and the stock service that controls autonomy"
+---
+
+Exactly one custom message type exists. Everything else uses stock ROS 2 types, deliberately — a payload that needed `core_interfaces` built just to read vehicle telemetry would be much harder to develop.
+
+## Command
+
+`core_interfaces/msg/Command` — the only message type that can move the vehicle.
+
+```
+string source_node
+uint64 timestamp
+
+uint8 CMD_MODE = 1
+uint8 CMD_ARM = 2
+uint8 CMD_WAYPOINT = 3
+uint8 CMD_EMERGENCY_HOLD = 4
+
+uint8 command_type
+
+string string_param
+float64[] float_params
+```
+
+Published on `/system/brain/command` by `brain_node`, consumed by `gateway_node`.
+
+### Fields
+
+| Field | Purpose |
+|-------|---------|
+| `source_node` | Must be `"core_autonomy"`. The gateway drops anything else and logs it. |
+| `timestamp` | Optional sender timestamp. Unused by the gateway. |
+| `command_type` | One of the constants below. |
+| `string_param` | `ENABLED` or `DISABLED` on a `CMD_MODE` heartbeat. |
+| `float_params` | `[latitude, longitude]` for `CMD_WAYPOINT`. |
+
+### Command types
+
+<AccordionGroup>
+  <Accordion title="CMD_MODE — heartbeat and intent" icon="heart-pulse">
+    Commands nothing. ArduPilot's flight mode is written exclusively by the operator via RC or a ground station.
+
+    It does two jobs instead:
+
+    - **Liveness.** The gateway's watchdog counts these; two seconds without one revokes the autonomy lease.
+    - **Intent.** `string_param` reports whether the brain is currently relaying. The gateway uses that to decide whether to request arming, so a vehicle whose operator selected GUIDED intending to drive it themselves is never spun up.
+  </Accordion>
+
+  <Accordion title="CMD_WAYPOINT — navigate to a position" icon="location-dot">
+    `float_params = [latitude, longitude]` in decimal degrees.
+
+    Translated to `SET_POSITION_TARGET_GLOBAL_INT` and forwarded **only** while the vehicle is in GUIDED. ArduPilot's own navigation controller handles the approach — the backseat says where, not how.
+  </Accordion>
+
+  <Accordion title="CMD_ARM, CMD_EMERGENCY_HOLD — reserved" icon="circle-pause">
+    Defined but not published by anything today. Arming is handled by the gateway's own reconciliation loop, which retries until ArduPilot's pre-arm checks pass. `CMD_EMERGENCY_HOLD` is reserved for an explicit operator-initiated stop.
+  </Accordion>
+</AccordionGroup>
+
+<Warning>
+Publishing a `Command` from a payload does not work. The gateway checks `source_node` and drops anything that is not `core_autonomy`, logging the attempt loudly enough to find later in a bag.
+
+Use `/payload/waypoints/waypoint` with `control_source: payload_waypoint` instead. That is not a lesser path — it is the one that gives your algorithm a geofence and a staleness check.
+</Warning>
+
+## /system/enable_autonomy
+
+Turning relaying on and off uses the stock `std_srvs/SetBool`:
+
+```
+bool data
+---
+bool success
+string message
+```
+
+```bash
+ros2 service call /system/enable_autonomy std_srvs/srv/SetBool "{data: true}"
+```
+
+A service rather than a topic because enabling needs an answer, and a refusal has to explain itself:
+
+```
+success=False
+message="Refused: ArduPilot must be in GUIDED (current: 'MANUAL').
+         Select GUIDED on the RC transmitter or in the ground station first."
+```
+
+Refusal reasons in practice:
+
+- the vehicle is not in GUIDED,
+- no valid GPS fix yet, so the geofence has no centre,
+- `control_source` is `mission` but the waypoint file loaded nothing,
+- one or more waypoints lie outside the geofence.
+
+<Note>
+Using a stock service type rather than defining one is a deliberate trade. It means an operator can enable autonomy from any machine with ROS 2 installed, with no need to build this repository's interface package — which matters when the machine is a laptop on a jetty.
+</Note>
+
+## Standard types used
+
+| Type | Used for |
+|------|----------|
+| `sensor_msgs/NavSatFix` | GPS position; payload waypoint targets |
+| `sensor_msgs/BatteryState` | Battery voltage, current, percentage |
+| `sensor_msgs/Temperature` | Autopilot and backseat temperatures |
+| `geometry_msgs/Twist` | Velocity commands |
+| `std_msgs/Float64` | Heading, speed, yaw rate |
+| `std_msgs/String` | Brain status, container stats |
+| `std_srvs/SetBool` | Enabling autonomy |
+| `diagnostic_msgs/DiagnosticArray` | Backseat system health |
+| `visualization_msgs/MarkerArray` | Geofence and waypoint geometry |
+
+## Should you define a custom message?
+
+Usually not.
+
+A custom `.msg` requires every consumer — the rosbag reader, Foxglove, any dashboard, other payloads — to have your interface package built and sourced. In a system where payloads are separate repositories built independently, that cost compounds quickly.
+
+<Steps>
+  <Step title="First, try a standard type">
+    `sensor_msgs` covers most instruments: `Temperature`, `FluidPressure`, `Imu`, `PointCloud2`, `Image`, `Range`.
+  </Step>
+  <Step title="Then, try a JSON string">
+    A `std_msgs/String` carrying JSON is readable by anything, needs no build step, and evolves without breaking consumers. The cost is that nothing validates the schema, so consumers must treat an unparseable message as absent rather than crashing on it.
+  </Step>
+  <Step title="Only then, define an interface">
+    If the research genuinely needs typed, high-rate, structured data, add a separate `ament_cmake` interface package inside your payload repository, and document that consumers must build it.
+  </Step>
+</Steps>

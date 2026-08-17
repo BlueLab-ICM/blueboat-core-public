@@ -1,0 +1,15 @@
+# MAVLink gateway: the only container permitted to command the frontseat.
+FROM ros:jazzy-ros-base
+
+RUN apt-get update && apt-get install -y --no-install-recommends python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip3 install pymavlink --break-system-packages
+
+WORKDIR /app/backseat_ws
+
+COPY src/core/core_gateway/ src/core/core_gateway/
+COPY src/interfaces/core_interfaces/ src/interfaces/core_interfaces/
+
+RUN /bin/bash -c "source /opt/ros/jazzy/setup.bash && colcon build"
+
+CMD ["/bin/bash", "-c", "source /opt/ros/jazzy/setup.bash && source install/setup.bash && ros2 run core_gateway gateway_node"]

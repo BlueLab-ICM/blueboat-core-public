@@ -1,0 +1,183 @@
+---
+title: "Waypoint missions"
+description: "Generating survey patterns, sizing the geofence, and running a mission"
+---
+
+A waypoint mission is the simplest thing the stack does, and the right way to verify a new vehicle before adding anything else. No code to write: a JSON file of coordinates and two commands.
+
+## Generate a pattern
+
+Two patterns cover most small-vessel survey work.
+
+<CardGroup cols={2}>
+  <Card title="Lawnmower" icon="grip-lines">
+    Parallel tracks with alternating direction.
+
+    **Uniform coverage of a rectangle.** Bathymetry, photo mosaics, anything where even spacing matters more than reaching a specific point.
+  </Card>
+  <Card title="Spiral" icon="hurricane">
+    An Archimedean spiral outward from a centre.
+
+    **Search around a believed position.** The boat covers the centre first, so effort concentrates where the target is most likely to be.
+  </Card>
+</CardGroup>
+
+```bash
+./scripts/generate-waypoints.py lawnmower \
+    --lat 41.362628 --lon 2.186193 \
+    --width 100 --height 80 --spacing 15 \
+    -o deployment/waypoints/site_a.json
+```
+
+```
+Wrote 16 waypoints to deployment/waypoints/site_a.json
+Furthest point is 64.0 m from the centre — set the brain's geofence_radius_m
+above this, or the mission will be refused.
+```
+
+That last line is the point of the tool. Sizing the geofence is the mistake that costs a run, and the generator gives you the number rather than leaving you to work it out from the corners.
+
+```bash
+./scripts/generate-waypoints.py spiral \
+    --lat 41.362628 --lon 2.186193 \
+    --radius 50 --arm-spacing 10 \
+    -o deployment/waypoints/search.json
+```
+
+The script needs only the Python standard library, so it runs anywhere.
+
+## Choosing the parameters
+
+<Tabs>
+  <Tab title="Lawnmower">
+    | Option | Meaning |
+    |--------|---------|
+    | `--width` | East-west extent, metres |
+    | `--height` | North-south extent, metres |
+    | `--spacing` | Distance between parallel tracks |
+
+    **Track spacing** comes from your sensor's swath, not from the boat. For a downward camera it is roughly the footprint width at your altitude above the seabed; for a sonar, the swath at working depth. Overlap tracks by 10-20% so a small heading error does not leave a gap.
+
+    Tracks run north-south. To survey a rectangle at another orientation, either rotate the coordinates yourself or accept the bounding box — for most sites the bounding box is fine.
+
+    <Note>
+    Legs alternate direction, so the pattern is one continuous track rather than a set of passes each needing a transit back to its start. That roughly halves the distance travelled, and is worth checking if you write your own generator.
+    </Note>
+  </Tab>
+
+  <Tab title="Spiral">
+    | Option | Meaning |
+    |--------|---------|
+    | `--radius` | Outer radius, metres |
+    | `--arm-spacing` | Radial distance between successive turns |
+    | `--point-spacing` | Approximate distance between waypoints |
+    | `--start-radius` | Radius of the first waypoint |
+
+    **Arm spacing** plays the role track spacing does in a lawnmower: set it from the sensor swath.
+
+    **Start radius** exists because a spiral starting at zero demands a turning circle tighter than the hull can hold. The 7 m default suits a BlueBoat; increase it if the boat overshoots the first few turns.
+
+    Points are placed at roughly constant *arc length* rather than constant angle, so the boat holds a steady speed instead of crawling through the tight inner turns and sprinting along the outer ones.
+  </Tab>
+</Tabs>
+
+## Size the geofence
+
+<Warning>
+`geofence_radius_m` must exceed the furthest waypoint from the geofence centre.
+
+The brain checks this when you enable autonomy and **refuses to start** if any waypoint falls outside:
+
+```
+Refused: 10 of 12 waypoints lie outside the 20 m geofence (first is number 1).
+Widen geofence_radius_m or move the pattern.
+```
+
+Refusing up front beats starting the survey and aborting a third of the way through it.
+</Warning>
+
+Leave at least 10% margin for GPS noise and for the boat overshooting a turn.
+
+Also mind the centre. Unless `geofence_home_lat`/`geofence_home_lon` are set, the fence centres on the **first valid GPS fix** — where the boat happened to be at startup, which may not be the centre your pattern was generated around. For a survey with a known site, set both explicitly:
+
+```bash
+ros2 param set --no-daemon /brain_node geofence_home_lat 41.362628
+ros2 param set --no-daemon /brain_node geofence_home_lon 2.186193
+ros2 param set --no-daemon /brain_node geofence_radius_m 80.0
+```
+
+## Run it
+
+```bash
+docker exec core_autonomy bash -c "source /opt/ros/jazzy/setup.bash && \
+  ros2 param set --no-daemon /brain_node control_source mission && \
+  ros2 param set --no-daemon /brain_node waypoint_file deployment/waypoints/site_a.json && \
+  ros2 service call /system/enable_autonomy std_srvs/srv/SetBool '{data: true}'"
+```
+
+The file is loaded at enable time, not at startup, so editing it and re-enabling is the whole edit cycle.
+
+Progress appears in the log:
+
+```
+Loaded 16 waypoints from /workspace/deployment/waypoints/site_a.json.
+Status: 'disabled' -> 'mission' [frontseat_mode='GUIDED' dist_from_home_m=0.0/80]
+Waypoint 1/16 reached.
+Waypoint 2/16 reached.
+```
+
+At the end the brain disables relaying by itself:
+
+```
+Mission complete: 16 waypoints reached. Relaying disabled.
+```
+
+Set `mission_loop` to `true` to repeat the pattern instead — useful for a monitoring station that should keep covering the same area.
+
+## Tuning arrival
+
+`waypoint_reached_tolerance_m` (default 4 m) is the radius at which a waypoint counts as reached. Too small and the boat circles a point it cannot quite hit; too large and it cuts corners. A 0.5 m floor is applied in code, so a value of zero cannot stall the mission on GPS noise alone.
+
+## Using another planner
+
+Any tool that produces coordinates will do. Both `lat`/`lon` and `latitude`/`longitude` are accepted, and a bare JSON list works as well as the wrapped form, so exports from external survey planners usually load unmodified:
+
+```python
+import json
+
+waypoints = [
+    {"index": i, "latitude": lat, "longitude": lon}
+    for i, (lat, lon) in enumerate(your_route, start=1)
+]
+with open('deployment/waypoints/custom.json', 'w') as handle:
+    json.dump({"waypoints": waypoints}, handle, indent=2)
+```
+
+Then run `pytest tests/` to confirm the file loads and fits a sensible fence.
+
+## Where files are resolved
+
+Paths are container paths, resolved in order:
+
+<Steps>
+  <Step title="/workspace/<path>">
+    The repository root, bind-mounted read-only. **This normally matches**, which is why editing a waypoint file takes effect on the next enable with no rebuild.
+  </Step>
+  <Step title="/opt/blueboat/waypoints/<filename>">
+    The copy baked into the brain image at build time — the fallback that keeps a mission runnable when the mount is missing.
+  </Step>
+</Steps>
+
+An absolute path is used exactly as given.
+
+<Note>
+The fallback means a file present in the image but not on disk still loads — with the version baked in at build time, not the one you just edited. If a waypoint change appears to have no effect, check the file is where you think it is.
+</Note>
+
+## Beyond fixed waypoints
+
+A waypoint list is open-loop: the boat follows it regardless of what it observes. To make the route depend on the data, move the decision into a payload and switch `control_source` to `payload_waypoint`.
+
+<Card title="Adding a payload" icon="cubes" href="/guides/adding-a-payload">
+  Your algorithm decides where to go; the brain keeps it inside the fence.
+</Card>

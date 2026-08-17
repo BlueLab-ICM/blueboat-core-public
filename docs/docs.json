@@ -1,0 +1,88 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "BlueBoat Core",
+  "description": "Open-source ROS 2 autonomy for the Blue Robotics BlueBoat ASV",
+  "colors": {
+    "primary": "#095E7A",
+    "light": "#4FB3D9",
+    "dark": "#0D7FA6"
+  },
+  "favicon": "/favicon.svg",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting started",
+            "pages": [
+              "index",
+              "getting-started/simulation",
+              "getting-started/on-the-vehicle",
+              "getting-started/concepts"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/gateway",
+              "architecture/brain",
+              "architecture/safety",
+              "architecture/topics"
+            ]
+          },
+          {
+            "group": "Hardware",
+            "pages": [
+              "hardware/overview",
+              "hardware/backseat-computer",
+              "hardware/communications",
+              "hardware/sensors"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/waypoint-missions",
+              "guides/adding-a-payload",
+              "guides/monitoring",
+              "guides/data-logging",
+              "guides/troubleshooting"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "reference/parameters",
+              "reference/messages",
+              "reference/scripts"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Payload template",
+        "href": "https://github.com/BlueLab-ICM/blueboat-payload-template"
+      }
+    ],
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/BlueLab-ICM/blueboat-core-public"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/BlueLab-ICM"
+    }
+  },
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg"
+  }
+}

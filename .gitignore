@@ -1,0 +1,24 @@
+# ROS 2 / colcon build output
+build/
+install/
+log/
+
+# Payload repositories, cloned by scripts/sync-payloads.sh
+src/payloads/*
+!src/payloads/.keep
+
+# Mission output, when DEPLOY_DATA_ROOT is left inside the repository
+deployment/logs/
+deployment/experiment_logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

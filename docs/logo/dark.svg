@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 260 64" role="img" aria-label="BlueBoat Core">
+  <rect width="64" height="64" rx="14" fill="#095E7A"/>
+  <g fill="#FFFFFF">
+    <path d="M12 34h16l-3 9a2 2 0 0 1-1.9 1.4h-6.2A2 2 0 0 1 15 43z"/>
+    <path d="M36 34h16l-3 9a2 2 0 0 1-1.9 1.4h-6.2A2 2 0 0 1 39 43z"/>
+    <rect x="30" y="14" width="4" height="20" rx="1.6"/>
+    <rect x="18" y="30" width="28" height="4" rx="2"/>
+  </g>
+  <path d="M8 52c5 0 5-3 10-3s5 3 10 3 5-3 10-3 5 3 10 3 5-3 8-3"
+        fill="none" stroke="#4FB3D9" stroke-width="4" stroke-linecap="round"/>
+  <text x="80" y="41"
+        font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif"
+        font-size="25" font-weight="600" letter-spacing="-0.4" fill="#F3F7F9">BlueBoat<tspan fill="#4FB3D9"> Core</tspan></text>
+</svg>

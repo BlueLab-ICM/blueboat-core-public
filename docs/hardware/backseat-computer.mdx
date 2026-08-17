@@ -1,0 +1,147 @@
+---
+title: "The backseat computer"
+description: "Choosing it, powering it, and joining it to the vehicle network"
+---
+
+The backseat computer is the one addition that makes everything else possible. It runs Ubuntu, Docker and ROS 2 Jazzy, and hosts every piece of software in this repository.
+
+## Choosing a board
+
+<CardGroup cols={2}>
+  <Card title="Raspberry Pi 5" icon="raspberry-pi">
+    **4-12 W.** Sensing, communications, logging, waypoint autonomy.
+
+    YOLO inference runs at roughly 1 Hz — enough to confirm a target, not enough to steer by one.
+  </Card>
+  <Card title="Jetson Orin Nano" icon="microchip">
+    **Up to 25 W.** Vision-driven autonomy and learned policies.
+
+    YOLO inference exceeds 5 Hz, which is a fast enough perception loop to close control around.
+  </Card>
+</CardGroup>
+
+The honest way to choose: if the boat has to *react* to what a camera sees, take the Jetson and pay the power. If the camera is recording for later analysis while the boat follows a plan, the Pi is the better engineering choice.
+
+Both need Ubuntu 22.04 or later. On the Jetson, that means JetPack 6.
+
+## Network
+
+The backseat joins the BlueBoat's onboard network through an Ethernet switch in the port hull. Wired, not wireless — MAVLink telemetry to the gateway should not compete with the operator's WiFi link.
+
+<Steps>
+  <Step title="Assign a static address">
+    BlueOS forwards MAVLink to a fixed IP, so the backseat must not move. The frontseat Pi is conventionally `192.168.2.2`.
+
+    ```bash
+    sudo nmcli connection modify "Wired connection 1" \
+        ipv4.addresses 192.168.2.10/24 \
+        ipv4.gateway 192.168.2.1 \
+        ipv4.method manual
+    sudo nmcli connection up "Wired connection 1"
+    ```
+  </Step>
+
+  <Step title="Add the MAVLink endpoint in BlueOS">
+    **Autopilot → MAVLink Endpoints**:
+
+    | Field | Value |
+    |-------|-------|
+    | Type | UDP Client |
+    | IP | `192.168.2.10` |
+    | Port | `14550` |
+
+    <Warning>
+    Check the existing endpoints and delete any stale entry pointing at an address the backseat no longer uses. A forgotten endpoint is the most common cause of a gateway that reports no heartbeat.
+    </Warning>
+  </Step>
+
+  <Step title="Verify the link">
+    ```bash
+    sudo tcpdump -i any -n udp port 14550
+    ```
+
+    Traffic from `192.168.2.2` means the frontseat is talking. Silence means the endpoint is wrong, or BlueOS has not applied it.
+  </Step>
+</Steps>
+
+## Power control
+
+The backseat is powered through a solid-state relay driven by a digital output on the flight controller, which gives two capabilities that matter in the field.
+
+<AccordionGroup>
+  <Accordion title="Endurance" icon="battery-half">
+    Missions that do not need autonomy run with the backseat unpowered. On a Jetson that is up to 25 W saved for the whole deployment — a meaningful fraction of the energy budget on a long survey.
+  </Accordion>
+
+  <Accordion title="Remote recovery" icon="power-off">
+    A wedged backseat — a kernel hang, a driver lockup, a full disk — can be power-cycled from the ground station over whatever link is still working.
+
+    This is the difference between a lost afternoon and a thirty-second interruption. It is also why the relay is worth the extra wiring even when endurance is not a concern.
+  </Accordion>
+</AccordionGroup>
+
+Configure a spare ArduPilot servo output as a relay (`RELAY_PIN`) and switch it from QGroundControl or the dashboard. Consult the [ArduPilot relay documentation](https://ardupilot.org/rover/docs/common-relay.html) for the current parameter names.
+
+<Warning>
+Cutting power to a running computer risks filesystem corruption. Prefer a graceful shutdown when the backseat is still responsive, and reserve the relay for when it is not. Mounting the data directory with `noatime` and using line-buffered logs — as the telemetry logger does — limits the damage when the abrupt path is the only one available.
+</Warning>
+
+## Software setup
+
+<Steps>
+  <Step title="Install Docker">
+    ```bash
+    curl -fsSL https://get.docker.com | sudo sh
+    sudo usermod -aG docker $USER
+    ```
+    Log out and back in.
+  </Step>
+
+  <Step title="Clone and build">
+    ```bash
+    git clone https://github.com/BlueLab-ICM/blueboat-core-public.git
+    cd blueboat-core-public
+    docker compose -f deployment/docker-compose.yml build
+    ```
+  </Step>
+
+  <Step title="Name the vehicle">
+    In `deployment/vehicle.env`:
+    ```bash
+    : "${VEHICLE_NAME:=my-boat}"
+    ```
+    Mission data paths derive from this, so two boats never write to the same directory.
+  </Step>
+
+  <Step title="Optional: a native ROS 2 install">
+    Everything runs in containers, so this is not required. A host-side ROS 2 installation is convenient for debugging with `ros2 topic echo` without entering a container — but remember that cross-container CLI calls need `--no-daemon`.
+  </Step>
+</Steps>
+
+## Thermal management
+
+A sealed watertight hull in the sun is a poor environment for a 25 W computer.
+
+Thermal throttling is the failure mode that shows up on the third hot afternoon rather than the first, and it degrades gracefully enough to be easy to miss: inference rate drops, the control loop slows, and the boat behaves slightly worse than it did in the morning.
+
+`sys_logger_node` publishes board temperature on `/backseat/temperature` and full diagnostics on `/diagnostics` for exactly this reason. Plot it across a deployment, and raise a `WARN` on sustained high utilisation:
+
+```bash
+ros2 topic echo /diagnostics
+```
+
+Practical mitigations: heatsink the board to the hull, keep the hull out of direct sun where possible, and consider the Pi 5 if the compute is not genuinely needed.
+
+## Verifying the installation
+
+```bash
+docker compose -f deployment/docker-compose.yml up -d
+docker logs core_gateway | head -20
+```
+
+```
+MAVLink Connected to Frontseat! (source=192.168.2.2, port=14550)
+Requested MAV_DATA_STREAM_POSITION at 5 Hz from frontseat.
+```
+
+If the gateway reports no heartbeat within 60 seconds, work through [troubleshooting](/guides/troubleshooting#the-gateway-cannot-find-the-autopilot).

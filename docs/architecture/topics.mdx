@@ -1,0 +1,151 @@
+---
+title: "Topics and services"
+description: "The ROS 2 interface between the vehicle, the autonomy and your code"
+---
+
+Three namespaces, with a rule for each.
+
+<CardGroup cols={3}>
+  <Card title="/frontseat/*" icon="ship">
+    Vehicle telemetry, published by the gateway.
+
+    **Read by anything. Written only by the gateway.**
+  </Card>
+  <Card title="/system/*" icon="brain">
+    Autonomy control and monitoring.
+
+    **Read freely. Commands written only by the brain.**
+  </Card>
+  <Card title="/payload/*" icon="cubes">
+    Payload outputs.
+
+    **Each payload owns its own subtree.**
+  </Card>
+</CardGroup>
+
+## /frontseat — vehicle telemetry
+
+Everything the autopilot knows, in standard ROS 2 message types. A payload can subscribe to these without depending on anything in this repository.
+
+| Topic | Type | Rate | Notes |
+|-------|------|------|-------|
+| `/frontseat/gps` | `sensor_msgs/NavSatFix` | ~5 Hz | Position, with `status` set from the real GPS fix type |
+| `/frontseat/heading` | `std_msgs/Float64` | ~5 Hz | Degrees from north. Omitted when the autopilot reports it invalid |
+| `/frontseat/speed` | `std_msgs/Float64` | ~5 Hz | Groundspeed in m/s, scalar |
+| `/frontseat/yaw_rate` | `std_msgs/Float64` | ~5 Hz | Body yaw rate in rad/s, IMU-derived |
+| `/frontseat/battery` | `sensor_msgs/BatteryState` | ~1 Hz | Voltage always; current and percentage when a sensor is fitted |
+| `/frontseat/temperature` | `sensor_msgs/Temperature` | ~1 Hz | Autopilot barometer |
+| `/frontseat/mode` | `std_msgs/String` | ~1 Hz | ArduPilot mode name: `GUIDED`, `MANUAL`, `HOLD`, … |
+
+<Warning>
+Check `status.status` on `/frontseat/gps` before using a position. ArduPilot publishes coordinates before its EKF converges, as (0, 0), and the gateway marks those `STATUS_NO_FIX`. A payload that trusts the first fix it receives will anchor its calculations on Null Island.
+</Warning>
+
+<Note>
+`/frontseat/mode` is the topic to check when nothing is moving. If it does not read `GUIDED`, no backseat command is reaching the vehicle — and that is the system working correctly.
+</Note>
+
+## /system — autonomy and monitoring
+
+<Tabs>
+  <Tab title="Commands">
+    | Topic | Type | Publisher |
+    |-------|------|-----------|
+    | `/system/brain/command` | `core_interfaces/Command` | `brain_node` only |
+    | `/system/brain/cmd_vel` | `geometry_msgs/Twist` | `brain_node` only |
+
+    <Warning>
+    Publishing to `/system/brain/command` from a payload does not work. The gateway drops any message whose `source_node` is not `core_autonomy` and logs the attempt.
+
+    Use `/payload/waypoints/waypoint` with `control_source: payload_waypoint` instead — that path is not a lesser one, it is the one that gives your algorithm a geofence and a staleness check.
+    </Warning>
+  </Tab>
+
+  <Tab title="Monitoring">
+    | Topic | Type | Contents |
+    |-------|------|----------|
+    | `/system/brain/status` | `std_msgs/String` | Current relay status |
+    | `/system/brain/visualization` | `visualization_msgs/MarkerArray` | Geofence, waypoints, boat pose |
+    | `/system/container_stats` | `std_msgs/String` | Per-container CPU and memory, CSV |
+    | `/diagnostics` | `diagnostic_msgs/DiagnosticArray` | Backseat CPU, memory, disk, temperature |
+    | `/backseat/temperature` | `sensor_msgs/Temperature` | Board temperature, for plotting |
+
+    Status values:
+
+    | Value | Meaning |
+    |-------|---------|
+    | `disabled` | Relaying is off |
+    | `mission` | Flying the loaded waypoint list |
+    | `mission_complete` | Last waypoint reached; relaying disabled itself |
+    | `relaying_waypoint` | Forwarding a payload position target |
+    | `relaying_velocity` | Forwarding a payload velocity target |
+    | `waiting_for_payload` | Payload has gone quiet; boat is not being commanded |
+    | `target_rejected` | Payload target lies outside the geofence |
+    | `geofence_stop` | The boat left the geofence; relaying disabled |
+
+    The last three are the ones to watch during payload development.
+  </Tab>
+
+  <Tab title="Services">
+    | Service | Type | Purpose |
+    |---------|------|---------|
+    | `/system/enable_autonomy` | `std_srvs/SetBool` | Turn command relaying on or off |
+
+    ```bash
+    ros2 service call /system/enable_autonomy std_srvs/srv/SetBool "{data: true}"
+    ```
+
+    A service rather than a topic because enabling needs an answer. A refusal explains itself:
+
+    ```
+    success=False
+    message="Refused: ArduPilot must be in GUIDED (current: 'MANUAL')."
+    ```
+
+    `std_srvs/SetBool` is a stock type, so the call works from any ROS 2 installation without building this repository's interfaces.
+  </Tab>
+</Tabs>
+
+## /payload — your code
+
+Two topics in this namespace are read by the brain. They are the entire interface for steering the boat from a payload:
+
+| Topic | Type | Read when `control_source` is |
+|-------|------|-------------------------------|
+| `/payload/waypoints/waypoint` | `sensor_msgs/NavSatFix` | `payload_waypoint` |
+| `/payload/cmd_vel` | `geometry_msgs/Twist` | `payload_velocity` |
+
+For `cmd_vel`, `linear.x` is forward speed in m/s and `angular.z` is yaw rate in rad/s. Lateral velocity is ignored — a skid-steer catamaran has no lateral thrust.
+
+Everything else under `/payload/<name>/*` is yours. It is recorded in the rosbag and visible to other payloads, but the brain ignores it.
+
+## Naming rules
+
+<Steps>
+  <Step title="Namespace everything you publish">
+    `/payload/<your_payload_name>/...`. The payload template does this for you.
+  </Step>
+  <Step title="Prefer standard message types">
+    `sensor_msgs`, `std_msgs`, `geometry_msgs`. A custom `.msg` requires every consumer — including the rosbag reader and any dashboard — to have your interface package built. It is rarely worth it.
+  </Step>
+  <Step title="Never publish to /frontseat or /system">
+    Those namespaces have exactly one writer each. A second publisher does not gain authority; it creates a debugging problem.
+  </Step>
+</Steps>
+
+## Inspecting a running system
+
+```bash
+docker exec -it core_autonomy bash
+source /opt/ros/jazzy/setup.bash
+
+ros2 topic list
+ros2 topic echo /frontseat/gps
+ros2 topic hz /frontseat/gps           # is telemetry actually flowing?
+ros2 node info /brain_node
+ros2 param list /brain_node
+```
+
+<Warning>
+Run these **inside** a container, not on the host. The ros2 CLI daemon caches a partial view of the DDS graph across container boundaries and will report nodes as missing when they are answering perfectly well. If a command must run from outside, add `--no-daemon` and name the message type explicitly.
+</Warning>

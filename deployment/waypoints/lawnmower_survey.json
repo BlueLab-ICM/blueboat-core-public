@@ -1,0 +1,101 @@
+{
+  "metadata": {
+    "type": "lawnmower",
+    "generated_at_utc": "2026-08-17T11:07:41.324469+00:00",
+    "center": {
+      "lat": 41.362628,
+      "lon": 2.186193
+    },
+    "parameters": {
+      "width_m": 80.0,
+      "height_m": 60.0,
+      "spacing_m": 15.0
+    }
+  },
+  "waypoints": [
+    {
+      "index": 1,
+      "latitude": 41.3623582,
+      "longitude": 2.18571371,
+      "north_m": -30.0,
+      "east_m": -40.0
+    },
+    {
+      "index": 2,
+      "latitude": 41.3628978,
+      "longitude": 2.18571371,
+      "north_m": 30.0,
+      "east_m": -40.0
+    },
+    {
+      "index": 3,
+      "latitude": 41.3628978,
+      "longitude": 2.18589344,
+      "north_m": 30.0,
+      "east_m": -25.0
+    },
+    {
+      "index": 4,
+      "latitude": 41.3623582,
+      "longitude": 2.18589344,
+      "north_m": -30.0,
+      "east_m": -25.0
+    },
+    {
+      "index": 5,
+      "latitude": 41.3623582,
+      "longitude": 2.18607318,
+      "north_m": -30.0,
+      "east_m": -10.0
+    },
+    {
+      "index": 6,
+      "latitude": 41.3628978,
+      "longitude": 2.18607318,
+      "north_m": 30.0,
+      "east_m": -10.0
+    },
+    {
+      "index": 7,
+      "latitude": 41.3628978,
+      "longitude": 2.18625291,
+      "north_m": 30.0,
+      "east_m": 5.0
+    },
+    {
+      "index": 8,
+      "latitude": 41.3623582,
+      "longitude": 2.18625291,
+      "north_m": -30.0,
+      "east_m": 5.0
+    },
+    {
+      "index": 9,
+      "latitude": 41.3623582,
+      "longitude": 2.18643265,
+      "north_m": -30.0,
+      "east_m": 20.0
+    },
+    {
+      "index": 10,
+      "latitude": 41.3628978,
+      "longitude": 2.18643265,
+      "north_m": 30.0,
+      "east_m": 20.0
+    },
+    {
+      "index": 11,
+      "latitude": 41.3628978,
+      "longitude": 2.18661238,
+      "north_m": 30.0,
+      "east_m": 35.0
+    },
+    {
+      "index": 12,
+      "latitude": 41.3623582,
+      "longitude": 2.18661238,
+      "north_m": -30.0,
+      "east_m": 35.0
+    }
+  ]
+}

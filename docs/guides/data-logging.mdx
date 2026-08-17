@@ -1,0 +1,185 @@
+---
+title: "Data and logging"
+description: "What the stack records, and how to work with it"
+---
+
+Two records, written side by side, for different purposes.
+
+<CardGroup cols={2}>
+  <Card title="Rosbag" icon="database">
+    **Complete and replayable.** Every topic, every message, full rate.
+
+    Replay a run, debug an interaction, or extract a signal you did not think to log at the time.
+
+    Enabled with `--profile record`.
+  </Card>
+  <Card title="JSONL telemetry" icon="table">
+    **Flat and analysis-ready.** Position, heading, speed, battery and status at 5 Hz.
+
+    One line of pandas, and no ROS installation needed anywhere near the analysis machine.
+
+    Always on.
+  </Card>
+</CardGroup>
+
+Neither replaces the other. The bag is the archive; the JSONL is the working copy.
+
+```
+data/
+├── rosbags/
+│   └── rosbag_20260817_142305/          complete MCAP recording
+└── telemetry/
+    └── telemetry_20260817_142312.jsonl  flat 5 Hz summary
+```
+
+`DATA_DIR` sets where this lives. Point it outside the repository so a git operation cannot touch it:
+
+```bash
+echo "DATA_DIR=$HOME/blueboat-data" > deployment/.env
+```
+
+## Working with the telemetry log
+
+```python
+import pandas as pd
+
+df = pd.read_json('data/telemetry/telemetry_20260817_142312.jsonl', lines=True)
+print(df.columns.tolist())
+# ['ts', 'lat', 'lon', 'heading_deg', 'speed_mps', 'yaw_rate_rads',
+#  'battery_v', 'frontseat_mode', 'brain_status']
+```
+
+Each line is a self-contained JSON object and the file is line-buffered, so an abrupt power loss can only ever damage the final partial line — every record written before it stays intact. That matters on a vehicle whose backseat computer can be power-cycled by relay.
+
+<AccordionGroup>
+  <Accordion title="Plot the track" icon="chart-line">
+    ```python
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    R = 6_371_000.0
+    lat0, lon0 = df.lat.iloc[0], df.lon.iloc[0]
+    north = np.radians(df.lat - lat0) * R
+    east = np.radians(df.lon - lon0) * R * np.cos(np.radians(lat0))
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.plot(east, north, linewidth=1, color='#2563eb')
+    ax.set_xlabel('East (m)')
+    ax.set_ylabel('North (m)')
+    ax.set_aspect('equal')
+    ```
+
+    Plotting in local metres rather than degrees is what makes the shape legible — and `set_aspect('equal')` is what stops a square survey looking rectangular.
+  </Accordion>
+
+  <Accordion title="Summarise a run" icon="calculator">
+    ```python
+    duration = (df.ts.iloc[-1] - df.ts.iloc[0]).total_seconds()
+
+    dn = np.diff(np.radians(df.lat) * R)
+    de = np.diff(np.radians(df.lon) * R * np.cos(np.radians(lat0)))
+    distance = np.hypot(dn, de).sum()
+
+    print(f'duration    {duration / 60:.1f} min')
+    print(f'distance    {distance:.0f} m')
+    print(f'mean speed  {df.speed_mps.mean():.2f} m/s')
+    ```
+  </Accordion>
+
+  <Accordion title="Split by what the brain was doing" icon="scissors">
+    ```python
+    for status, group in df.groupby('brain_status'):
+        print(f'{status:24s} {len(group) / 5:6.1f} s')
+    ```
+
+    ```
+    disabled                    42.4 s
+    mission                    812.6 s
+    waiting_for_payload         18.2 s
+    ```
+
+    A useful sanity check: time in `waiting_for_payload` is time your algorithm was not keeping up.
+  </Accordion>
+
+  <Accordion title="Isolate an autonomous run" icon="crop">
+    Logging runs continuously, so a file may contain several runs separated by periods of `disabled`.
+
+    ```python
+    active = df[df.brain_status != 'disabled']
+    ```
+
+    To get one file per run instead, set `session_name` before each:
+
+    ```bash
+    ros2 param set --no-daemon /telemetry_logger_node session_name transect_3
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Working with rosbags
+
+<Tabs>
+  <Tab title="Replay">
+    ```bash
+    docker exec -it core_autonomy bash
+    source /opt/ros/jazzy/setup.bash
+
+    ros2 bag info /app/backseat_ws/logs/rosbag_20260817_142305
+    ros2 bag play /app/backseat_ws/logs/rosbag_20260817_142305
+    ```
+
+    Replaying into a running stack lets a payload be re-run against real recorded telemetry — the fastest way to debug a perception model without going back to the water.
+  </Tab>
+
+  <Tab title="Read in Python">
+    ```python
+    from rosbags.highlevel import AnyReader
+    from pathlib import Path
+
+    with AnyReader([Path('data/rosbags/rosbag_20260817_142305')]) as reader:
+        connections = [c for c in reader.connections if c.topic == '/frontseat/gps']
+        for connection, timestamp, raw in reader.messages(connections=connections):
+            msg = reader.deserialize(raw, connection.msgtype)
+            print(timestamp, msg.latitude, msg.longitude)
+    ```
+
+    The [`rosbags`](https://pypi.org/project/rosbags/) package reads MCAP without a ROS installation, which matters when the analysis machine is not the vehicle.
+  </Tab>
+
+  <Tab title="Foxglove">
+    Open the `.mcap` file directly in [app.foxglove.dev](https://app.foxglove.dev) — no conversion needed. Scrub through the run with the 3D panel showing the geofence, waypoints and boat position exactly as they appeared live.
+
+    Usually the fastest way to answer "what was the boat doing at 14:31".
+  </Tab>
+</Tabs>
+
+## Keeping bags manageable
+
+Recording every topic including a camera stream fills a disk in minutes, and a full disk stops the recorder silently.
+
+```bash
+# deployment/.env
+BAG_EXCLUDE_REGEX=^/payload/camera/image_raw$
+```
+
+The variable is one anchored alternation regex, not a list, so several topics are joined with `|`. Have the camera payload save frames itself, at a rate you choose.
+
+## Container logs
+
+<Warning>
+`docker compose down` removes the containers and their logs go with them. Capture them first — they are frequently the only record of why a payload misbehaved.
+
+```bash
+for c in $(docker ps --format '{{.Names}}'); do docker logs "$c" &> "data/${c}.log"; done
+```
+</Warning>
+
+## Getting data ashore
+
+```bash
+rsync -avz --progress backseat@192.168.2.10:~/blueboat-data/ ./missions/
+```
+
+<Warning>
+Copy over WiFi at the dock, not over cellular. A bag with the camera excluded is still hundreds of megabytes; with one included it is many gigabytes.
+</Warning>

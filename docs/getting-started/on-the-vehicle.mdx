@@ -1,0 +1,196 @@
+---
+title: "On a real vehicle"
+description: "Taking the stack from simulation to a boat in the water"
+---
+
+This page assumes the [hardware is installed](/hardware/overview) and you have run a mission [in simulation](/getting-started/simulation). What follows is what changes when there is a real boat.
+
+## One-time setup
+
+<Steps>
+  <Step title="Install Docker on the backseat computer">
+    ```bash
+    curl -fsSL https://get.docker.com | sudo sh
+    sudo usermod -aG docker $USER
+    ```
+
+    Log out and back in for the group change to take effect.
+  </Step>
+
+  <Step title="Give the backseat a static IP">
+    BlueOS forwards MAVLink to a fixed address, so the backseat must not move. On the BlueBoat's onboard network the frontseat Pi is `192.168.2.2`.
+
+    ```bash
+    sudo nmcli connection modify "Wired connection 1" \
+        ipv4.addresses 192.168.2.10/24 ipv4.method manual
+    sudo nmcli connection up "Wired connection 1"
+    ```
+  </Step>
+
+  <Step title="Point BlueOS at the backseat">
+    In the BlueOS web interface, open **Autopilot → MAVLink Endpoints** and add:
+
+    | Field | Value |
+    |-------|-------|
+    | Type | UDP Client |
+    | IP | `192.168.2.10` (the backseat) |
+    | Port | `14550` |
+
+    Check the existing endpoints while you are there and delete any stale entry pointing at an address the backseat no longer uses. A forgotten endpoint is the most common cause of "the gateway sees no heartbeat".
+  </Step>
+
+  <Step title="Clone and build">
+    ```bash
+    git clone https://github.com/BlueLab-ICM/blueboat-core-public.git
+    cd blueboat-core-public
+    docker compose -f deployment/docker-compose.yml build
+    ```
+  </Step>
+
+  <Step title="Decide where data goes">
+    By default the stack writes to `./data` inside the repository. Point it somewhere a git operation cannot touch:
+
+    ```bash
+    echo "DATA_DIR=$HOME/blueboat-data" > deployment/.env
+    ```
+  </Step>
+</Steps>
+
+## Before every deployment
+
+<Warning>
+Do these at the dock, with WiFi. `docker build` needs the network, and BuildKit DNS frequently fails over cellular. Discovering a missing image offshore ends the day.
+</Warning>
+
+<Steps>
+  <Step title="Fetch and build payloads">
+    ```bash
+    ./scripts/sync-payloads.sh
+    ```
+  </Step>
+
+  <Step title="Prepare the waypoint pattern">
+    ```bash
+    ./scripts/generate-waypoints.py lawnmower \
+        --lat <launch-lat> --lon <launch-lon> \
+        --width 100 --height 80 --spacing 15 \
+        -o deployment/waypoints/site_a.json
+    ```
+
+    The tool reports the furthest point from the centre. Set `geofence_radius_m` above it — the brain refuses a mission whose waypoints fall outside the fence, which is far better than discovering the mismatch mid-survey.
+  </Step>
+
+  <Step title="Check the configuration">
+    ```bash
+    pytest tests/
+    ```
+  </Step>
+</Steps>
+
+## On the water
+
+<Steps>
+  <Step title="Verify the standard workflow first">
+    Connect QGroundControl over WiFi and confirm you can arm, drive manually and see telemetry. If the ordinary BlueBoat workflow is unhealthy, adding autonomy will only obscure the problem.
+  </Step>
+
+  <Step title="Start the stack">
+    ```bash
+    ssh backseat@192.168.2.10
+    cd blueboat-core-public
+    docker compose -f deployment/docker-compose.yml --profile record up -d
+    ```
+
+    `--profile record` adds the rosbag recorder. Confirm the gateway found the autopilot:
+
+    ```bash
+    docker logs core_gateway | head -20
+    # MAVLink Connected to Frontseat! (source=192.168.2.2, port=14550)
+    ```
+  </Step>
+
+  <Step title="Configure the mission">
+    ```bash
+    docker exec core_autonomy bash -c "source /opt/ros/jazzy/setup.bash && \
+      ros2 param set --no-daemon /brain_node waypoint_file deployment/waypoints/site_a.json && \
+      ros2 param set --no-daemon /brain_node geofence_radius_m 90.0"
+    ```
+
+    Parameters can also be set from a YAML file with `ros2 param load` if you prefer to keep per-site settings in version control.
+  </Step>
+
+  <Step title="Hand over control">
+    Select **GUIDED** on the RC transmitter or in QGroundControl.
+
+    This is the moment autonomy becomes possible. Until it happens, enabling will be refused — deliberately, so no mission can begin while you still believe you are in manual control.
+  </Step>
+
+  <Step title="Enable autonomy">
+    ```bash
+    docker exec core_autonomy bash -c "source /opt/ros/jazzy/setup.bash && \
+      ros2 service call /system/enable_autonomy std_srvs/srv/SetBool '{data: true}'"
+    ```
+
+    The gateway now requests arming and retries until ArduPilot's pre-arm checks pass. Keep the RC transmitter in your hands: switching out of GUIDED returns control instantly.
+  </Step>
+
+  <Step title="Stop and collect">
+    ```bash
+    docker compose -f deployment/docker-compose.yml --profile record down
+    ```
+
+    <Note>
+    Capture the container logs *before* bringing the stack down — `docker compose down` removes the containers and their logs go with them:
+
+    ```bash
+    for c in $(docker ps --format '{{.Names}}'); do
+        docker logs "$c" &> "data/${c}.log"
+    done
+    ```
+    </Note>
+  </Step>
+</Steps>
+
+## What to watch during a run
+
+<CardGroup cols={2}>
+  <Card title="The brain" icon="terminal">
+    ```bash
+    docker logs -f core_autonomy
+    ```
+    Status transitions and waypoint progress. Quiet is healthy — the log is edge-triggered.
+  </Card>
+  <Card title="System health" icon="temperature-half">
+    ```bash
+    ros2 topic echo /diagnostics
+    ```
+    A sealed hull in the sun throttles a Jetson before anything else fails.
+  </Card>
+</CardGroup>
+
+## Pre-flight checklist
+
+<AccordionGroup>
+  <Accordion title="Before leaving the dock" icon="anchor">
+    - Payload images built (`./scripts/sync-payloads.sh` ran cleanly)
+    - Waypoint pattern generated for today's launch point
+    - `geofence_radius_m` comfortably exceeds the pattern extent
+    - `pytest tests/` passes
+    - Enough free disk for the rosbag (`df -h`)
+    - RC transmitter on, bound, and reaching the boat
+  </Accordion>
+
+  <Accordion title="Before enabling autonomy" icon="list-check">
+    - Manual control verified in the water
+    - GPS lock acquired and stable
+    - Battery voltage healthy on `/frontseat/battery`
+    - GUIDED selected by you, not by software
+    - Clear line of sight and no traffic in the survey area
+  </Accordion>
+
+  <Accordion title="If something looks wrong" icon="triangle-exclamation">
+    Switch out of GUIDED. That is the whole procedure — the gateway stops forwarding within one control cycle and the autopilot holds the vehicle.
+
+    Diagnose afterwards, from the logs, on shore. [Troubleshooting →](/guides/troubleshooting)
+  </Accordion>
+</AccordionGroup>

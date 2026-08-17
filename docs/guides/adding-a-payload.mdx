@@ -1,0 +1,271 @@
+---
+title: "Adding a payload"
+description: "Build an algorithm that steers the boat, without modifying the core stack"
+---
+
+A payload is any code that is not core autonomy: a sensor driver, a perception model, a planner, an adaptive sampling algorithm. Each one is a separate repository and a separate container, and the interface between it and the vehicle is a handful of ROS 2 topics.
+
+This guide builds a complete payload that reads GPS, decides where to go, and steers the boat — with the geofence and timeout protections applied on its behalf.
+
+<Note>
+You will not modify this repository at any point. That is the design working: your algorithm's blast radius is its own container.
+</Note>
+
+## 1. Create the repository
+
+Do not clone the template. Use GitHub's template feature so you get a clean repository of your own.
+
+<Steps>
+  <Step title="Generate from the template">
+    Go to [blueboat-payload-template](https://github.com/BlueLab-ICM/blueboat-payload-template), click **Use this template → Create a new repository**, and name it — `adaptive-sampling-payload`, for instance.
+  </Step>
+
+  <Step title="Clone and configure it">
+    ```bash
+    git clone git@github.com:<your-org>/adaptive-sampling-payload.git
+    cd adaptive-sampling-payload
+
+    # ROS 2 package names need underscores, never hyphens
+    ./setup-payload.sh adaptive_sampling
+    ```
+
+    The script renames the package throughout the repository and then deletes itself.
+  </Step>
+</Steps>
+
+## 2. Write the node
+
+Everything happens in `adaptive_sampling/adaptive_sampling/main_node.py`. Here is a payload that surveys outward in a widening circle and slows its sampling near a detected feature:
+
+```python
+import math
+
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import NavSatFix
+from std_msgs.msg import Float64
+
+EARTH_RADIUS_M = 6_371_000.0
+
+
+class AdaptiveSamplingNode(Node):
+    def __init__(self):
+        super().__init__('adaptive_sampling_node')
+
+        # --- Inputs: standard vehicle telemetry from the gateway ---
+        self.create_subscription(NavSatFix, '/frontseat/gps', self.on_gps, 10)
+        self.create_subscription(Float64, '/frontseat/heading', self.on_heading, 10)
+
+        # --- Output: the topic the brain reads in payload_guided mode ---
+        self.waypoint_pub = self.create_publisher(
+            NavSatFix, '/payload/waypoints/waypoint', 10)
+
+        # --- Your own data, namespaced to this payload ---
+        self.status_pub = self.create_publisher(
+            Float64, '/payload/adaptive_sampling/coverage', 10)
+
+        self.origin = None
+        self.bearing_rad = 0.0
+        self.radius_m = 10.0
+
+        # 1 Hz is plenty. The brain re-publishes the current target to the
+        # autopilot at 10 Hz, so this only has to be faster than the
+        # staleness timeout, not faster than the control loop.
+        self.create_timer(1.0, self.plan)
+
+    def on_gps(self, msg: NavSatFix) -> None:
+        self.position = (msg.latitude, msg.longitude)
+        if self.origin is None:
+            # Anchor the pattern where the mission actually started.
+            self.origin = self.position
+
+    def on_heading(self, msg: Float64) -> None:
+        self.heading_deg = float(msg.data)
+
+    def plan(self) -> None:
+        if self.origin is None:
+            return   # no fix yet; publishing now would send the boat to (0, 0)
+
+        # ---- Replace this with your actual algorithm ----
+        self.bearing_rad += math.radians(30.0)
+        self.radius_m = min(self.radius_m + 2.0, 40.0)
+
+        north = self.radius_m * math.cos(self.bearing_rad)
+        east = self.radius_m * math.sin(self.bearing_rad)
+        # -------------------------------------------------
+
+        target = NavSatFix()
+        target.latitude = self.origin[0] + math.degrees(north / EARTH_RADIUS_M)
+        target.longitude = self.origin[1] + math.degrees(
+            east / (EARTH_RADIUS_M * math.cos(math.radians(self.origin[0]))))
+        self.waypoint_pub.publish(target)
+
+        coverage = Float64()
+        coverage.data = self.radius_m
+        self.status_pub.publish(coverage)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = AdaptiveSamplingNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+```
+
+<Warning>
+The `cos(latitude)` term is not optional. Without it, every pattern is stretched east-west — by about 25% at the latitude of Barcelona, and more the further from the equator you work.
+</Warning>
+
+## 3. Declare what it does
+
+`manifest.yaml` is the payload's identity card. Keep it accurate: it is what the next person reads to understand what your code touches.
+
+```yaml
+name: adaptive_sampling
+description: "Widening-circle survey with sampling density driven by observations."
+read_topics:
+  - /frontseat/gps
+  - /frontseat/heading
+write_topics:
+  - /payload/waypoints/waypoint
+  - /payload/adaptive_sampling/coverage
+requires_network: false
+requires_gpu: false
+```
+
+## 4. Add dependencies
+
+Anything beyond the standard library goes in `requirements.txt`:
+
+```
+numpy
+scipy
+```
+
+Docker installs them into the container at build time.
+
+## 5. Test it locally
+
+```bash
+cd docker
+docker compose -f docker-compose.payload.yml up --build
+```
+
+A clean build printing `adaptive_sampling Node Online` means the structure is sound. To exercise it properly, run it against the simulator:
+
+<Steps>
+  <Step title="Start the simulation">
+    ```bash
+    cd ../blueboat-core-public
+    docker compose -f deployment/docker-compose.yml -f deployment/docker-compose.sitl.yml up -d
+    ./scripts/sim-set-mode.py GUIDED
+    ```
+  </Step>
+
+  <Step title="Start your payload alongside it">
+    ```bash
+    cd ../adaptive-sampling-payload/docker
+    docker compose -f docker-compose.payload.yml up -d
+    ```
+  </Step>
+
+  <Step title="Run a payload_guided mission">
+    ```bash
+    cd ../../blueboat-core-public
+    docker exec core_autonomy bash -c "source /opt/ros/jazzy/setup.bash && \
+      ros2 param set --no-daemon /brain_node control_source payload_waypoint && \
+      ros2 service call /system/enable_autonomy std_srvs/srv/SetBool '{data: true}'"
+    ```
+
+    The boat now follows your algorithm. Watch it in Foxglove at `ws://localhost:8765`.
+  </Step>
+
+  <Step title="Prove the safety net">
+    Stop your payload mid-mission:
+
+    ```bash
+    docker stop payload_adaptive_sampling
+    ```
+
+    The boat holds station at the mission home rather than continuing towards your last target. Then try publishing a waypoint far outside the geofence and watch the mission abort rather than follow it.
+  </Step>
+</Steps>
+
+## 6. Deploy to the vehicle
+
+<Tabs>
+  <Tab title="Public repository">
+    Add it directly to `deployment/payload-registry.yaml`:
+
+    ```yaml
+    payloads:
+      - name: adaptive-sampling-payload
+        repo: https://github.com/<your-org>/adaptive-sampling-payload.git
+        version: main
+        enabled: true
+    ```
+  </Tab>
+
+  <Tab title="Private repository">
+    Generate a deploy key scoped to that one repository:
+
+    ```bash
+    ./scripts/register-payload.sh adaptive-sampling-payload <your-org>
+    ```
+
+    Add the printed public key at **Settings → Deploy keys** on the repository, read-only. The script has already added the registry entry and the SSH host alias.
+  </Tab>
+</Tabs>
+
+Then, on the backseat computer:
+
+```bash
+./scripts/sync-payloads.sh          # clone and build, at the dock
+docker compose -f deployment/docker-compose.yml up -d
+docker compose -f src/payloads/adaptive-sampling-payload/docker/docker-compose.payload.yml \
+    -p adaptive-sampling-payload up -d
+```
+
+## Choosing an output
+
+<CardGroup cols={2}>
+  <Card title="payload_guided" icon="location-dot">
+    Publish `NavSatFix` to `/payload/waypoints/waypoint`.
+
+    **Prefer this.** A waypoint is a destination, so a dropped message costs nothing — the autopilot is still driving to the last one. Publishing at 1 Hz is fine.
+  </Card>
+  <Card title="payload_velocity" icon="gauge-high">
+    Publish `Twist` to `/payload/cmd_vel`, with `linear.x` in m/s and `angular.z` in rad/s.
+
+    For tight control loops such as visual servoing. Velocities are latched by the autopilot, so publish steadily and expect the brain to zero them the moment you go quiet.
+  </Card>
+</CardGroup>
+
+## Rules worth following
+
+<AccordionGroup>
+  <Accordion title="Namespace everything you publish" icon="folder-tree">
+    `/payload/<your_name>/...`. Never publish to `/frontseat/*` or `/system/*` — those have exactly one writer each, and a second one creates a debugging problem rather than an authority.
+  </Accordion>
+
+  <Accordion title="Prefer standard message types" icon="message">
+    A custom `.msg` requires every consumer — the rosbag reader, Foxglove, the dashboard, other payloads — to have your interface package built. `sensor_msgs`, `std_msgs` and `geometry_msgs` cover most needs. Build a custom interface only when the research genuinely requires it.
+  </Accordion>
+
+  <Accordion title="Never block a callback" icon="hourglass">
+    Heavy work inside a subscription callback stalls the executor and stops your node publishing. Cache the message, do the work on a timer, and if it is genuinely slow, put it on a thread.
+  </Accordion>
+
+  <Accordion title="Do not try to command the vehicle directly" icon="ban">
+    Publishing to `/system/brain/command` does not work — the gateway drops anything whose `source_node` is not `core_autonomy` and logs the attempt. Going through `payload_waypoint` is not a restriction on what you can do; it is what gives your algorithm a geofence.
+  </Accordion>
+
+  <Accordion title="Fail quietly and stop" icon="shield">
+    If your algorithm cannot decide, stop publishing. The staleness check turns silence into a safe stop within `payload_command_timeout_sec`. Publishing a guess is worse than publishing nothing.
+  </Accordion>
+</AccordionGroup>

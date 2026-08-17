@@ -1,0 +1,166 @@
+---
+title: "The gateway"
+description: "MAVLink translation, authorisation, and the watchdog that revokes it"
+---
+
+`gateway_node` is the only node in the system with a MAVLink connection to the autopilot, and the only one that can move the vehicle. Everything else is advisory.
+
+Source: [`src/core/core_gateway/core_gateway/gateway_node.py`](https://github.com/BlueLab-ICM/blueboat-core-public/blob/main/src/core/core_gateway/core_gateway/gateway_node.py)
+
+## Finding the right autopilot
+
+At startup the gateway binds a UDP port and waits for a heartbeat. Which heartbeat it accepts matters more than it first appears:
+
+```python
+if (msg.get_srcComponent() == mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1
+        and msg.type in (MAV_TYPE_SURFACE_BOAT, MAV_TYPE_GROUND_ROVER)):
+    self.boat.target_system = msg.get_srcSystem()
+    self.boat.target_component = msg.get_srcComponent()
+```
+
+The BlueOS MAVLink router forwards *every* component's heartbeats to the same endpoint. `mavlink2rest` (component 194), the camera manager (components 100-105) and any connected ground station all share the stream, and their heartbeats carry `custom_mode = 0`.
+
+Locking onto one of those has a specific and confusing failure signature: the gateway reports MANUAL forever, refuses to forward anything, and addresses its commands to a component that ignores them. Requiring both the autopilot component ID and a rover or boat vehicle type removes the ambiguity.
+
+<Warning>
+Two environment variables exist for the case where a simulator and a real vehicle are on the same network. `MAVLINK_PORT` moves the gateway off the BlueOS default of 14550, and `GATEWAY_EXPECTED_SOURCE` makes it abort at startup if the heartbeat arrives from an unexpected address. The simulation compose file sets both. Nothing is more expensive than a gateway that quietly arms the wrong boat.
+</Warning>
+
+## Telemetry, upward
+
+ArduPilot does not stream everything by default, so the gateway asks for what the stack needs:
+
+| Stream | Message | Published as |
+|--------|---------|--------------|
+| `POSITION` | `GLOBAL_POSITION_INT` | `/frontseat/gps`, `/frontseat/heading` |
+| `EXTRA1` | `VFR_HUD` | `/frontseat/speed` |
+| `EXTRA2` | `ATTITUDE` | `/frontseat/yaw_rate` |
+| — | `SYS_STATUS` | `/frontseat/battery` |
+| — | `SCALED_PRESSURE` | `/frontseat/temperature` |
+| — | `HEARTBEAT` | `/frontseat/mode` |
+
+All of these are standard ROS 2 message types, which is what lets a payload subscribe to vehicle telemetry without depending on anything in this repository.
+
+Each 10 Hz tick drains the entire MAVLink receive queue rather than reading one message:
+
+```python
+while True:
+    msg = self.boat.recv_match(blocking=False)
+    if not msg:
+        break
+    ...
+```
+
+`ATTITUDE` arrives far faster than `GLOBAL_POSITION_INT`. Reading one message per tick would let attitude messages starve position updates and leave the brain navigating on stale GPS.
+
+## Commands, downward
+
+<Tabs>
+  <Tab title="Waypoints">
+    A `Command` with `command_type = CMD_WAYPOINT` becomes a global position target:
+
+    ```python
+    self.boat.mav.set_position_target_global_int_send(
+        0, target_system, target_component,
+        MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+        3576,                      # type mask: use position only
+        lat_int, lon_int, 0,
+        0, 0, 0, 0, 0, 0, 0, 0)
+    ```
+
+    ArduPilot's own navigation controller handles the approach. The backseat says where, not how — which is why a dropped waypoint message is harmless: the autopilot is still driving to the last one.
+  </Tab>
+
+  <Tab title="Velocities">
+    A `Twist` becomes a body-frame velocity target:
+
+    ```python
+    type_mask = 0x04C7   # use vx, vy, vz and yaw_rate; ignore the rest
+
+    self.boat.mav.set_position_target_local_ned_send(
+        0, target_system, target_component,
+        MAV_FRAME_BODY_NED,        # vx is forward along the hull
+        type_mask,
+        0, 0, 0,                   # position, ignored
+        msg.linear.x, 0.0, 0.0,    # vx, vy, vz
+        0, 0, 0,                   # acceleration, ignored
+        0,                         # yaw angle, ignored
+        msg.angular.z)             # yaw rate
+    ```
+
+    `MAV_FRAME_BODY_NED` means `vx` is forward along the hull rather than geographic north. `vy` is always zero: a skid-steer catamaran has no lateral thrust.
+
+    Velocity commands are latched by the autopilot until superseded, which is why the brain publishes a zero `Twist` when it stops rather than simply falling silent.
+  </Tab>
+</Tabs>
+
+## Three gates
+
+Every command passes three checks before it becomes MAVLink.
+
+<Steps>
+  <Step title="Is the sender authorised?">
+    ```python
+    if msg.source_node != "core_autonomy":
+        self.get_logger().warn(
+            f"SECURITY REJECT: Unauthorized node '{msg.source_node}' "
+            "tried to command the boat!")
+        return
+    ```
+
+    ROS 2 topics are visible to every node on the graph, so a payload *can* publish to the command topic. This check is what makes doing so pointless — and loud, since the rejection is logged and recorded in the bag.
+  </Step>
+
+  <Step title="Is the vehicle in GUIDED?">
+    ```python
+    if self._actual_mode_num != _ROVER_MODE['GUIDED']:
+        return
+    ```
+
+    The mode comes from `HEARTBEAT` telemetry — read, never written.
+
+    This check is doing more work than it appears to. ArduRover will **auto-enter GUIDED** on receiving a `SET_POSITION_TARGET`. Without the gate, a backseat command would silently pull the vehicle out of the mode the operator chose, which is precisely the override the architecture exists to prevent.
+  </Step>
+
+  <Step title="Is the autonomy alive?">
+    ```python
+    if self.autonomy_active and (time.time() - self.last_heartbeat_time > 2.0):
+        self.get_logger().error("FAILSAFE: Brain Heartbeat Lost! ...")
+        self.autonomy_active = False
+    ```
+
+    The lease is acquired on the first heartbeat received while in GUIDED, renewed by every subsequent one, and revoked after two seconds of silence.
+  </Step>
+</Steps>
+
+## What the failsafe does not do
+
+When the watchdog fires, the gateway revokes the lease and stops forwarding. That is all.
+
+It does not change the flight mode. It does not disarm. It does not command a return home.
+
+<Note>
+This is a deliberate choice, and an earlier version of this system got it wrong. A watchdog that disarms on every trip prevents ArduPilot's HOLD mode from applying thruster corrections against wave drift — so the "safety" action produced a boat drifting freely with no mission running. Any autonomous recovery is a decision made by a system that has just demonstrated it cannot be trusted to make decisions. Stopping and handing the vehicle back is the only action that is unambiguously correct.
+</Note>
+
+## Arming
+
+Arming is reconciled rather than commanded once. The gateway tracks a desired and an actual armed state and retries at 1 Hz until they agree:
+
+```python
+if self._desired_armed and not self._actual_armed:
+    self._send_arm_disarm(True)
+```
+
+ArduPilot's pre-arm checks can take several seconds to pass after EKF convergence, and longer on a real vehicle with a cold GPS. A single arm request at startup would usually fail; retrying until the `SAFETY_ARMED` bit appears in the heartbeat is what makes startup reliable.
+
+Set the `auto_arm` parameter to `false` on deployments where arming must stay strictly operator-gated.
+
+<CardGroup cols={2}>
+  <Card title="The brain" icon="brain" href="/architecture/brain">
+    What produces the commands the gateway forwards.
+  </Card>
+  <Card title="The safety model" icon="shield-halved" href="/architecture/safety">
+    Every protection in the system, and what each one catches.
+  </Card>
+</CardGroup>

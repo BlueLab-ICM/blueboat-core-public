@@ -1,0 +1,111 @@
+# Core services for the BlueBoat backseat computer.
+#
+#   docker compose -f deployment/docker-compose.yml up -d --build
+#
+# Optional profiles:
+#   --profile record   record every topic to a rosbag
+#   --profile remote   bridge topics over Zenoh for a remote dashboard
+#
+# Every service uses `network_mode: host` and `ipc: host`. Host IPC is not
+# optional: ROS 2's default DDS middleware uses shared memory for same-machine
+# transport, and without a shared IPC namespace containers either fall back to
+# loopback UDP or fail to discover each other entirely. Payload containers need
+# both settings too.
+#
+# `restart: no` on the autonomy services is deliberate. A brain that crashes
+# should stay down so the gateway watchdog revokes the autonomy lease and the
+# operator gets an unambiguous signal, rather than silently bouncing.
+
+services:
+  # MAVLink bridge to the ArduPilot frontseat. The only service that can move
+  # the boat.
+  gateway:
+    image: blueboat-gateway
+    build:
+      context: ../
+      dockerfile: deployment/Dockerfile.gateway
+    container_name: core_gateway
+    network_mode: "host"
+    ipc: "host"
+    restart: no
+    environment:
+      # UDP port to listen on. 14550 is the BlueOS/Navigator default; the
+      # simulation override uses a different port so the gateway can never
+      # reach a real vehicle on the same network.
+      - MAVLINK_PORT=${MAVLINK_PORT:-14550}
+      # Optional: refuse to start unless the first vehicle heartbeat arrives
+      # from this address. Worth setting when a simulator and a real vehicle
+      # might share a network.
+      - GATEWAY_EXPECTED_SOURCE=${GATEWAY_EXPECTED_SOURCE:-}
+
+  # Gateway keepalive, safety-gated command relay, diagnostics and telemetry
+  # logging.
+  brain:
+    image: blueboat-brain
+    build:
+      context: ../
+      dockerfile: deployment/Dockerfile.brain
+    container_name: core_autonomy
+    network_mode: "host"
+    ipc: "host"
+    restart: no
+    depends_on:
+      - gateway
+    volumes:
+      # Read-only: lets the brain publish container resource statistics.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Repository root, read-only, so waypoint files can be edited without
+      # rebuilding the image.
+      - ../:/workspace:ro
+      # Writable output. Override DATA_DIR to keep mission data outside the
+      # repository, where a git operation cannot touch it.
+      - ${DATA_DIR:-../data}/rosbags:/app/backseat_ws/logs
+      - ${DATA_DIR:-../data}/telemetry:/app/backseat_ws/telemetry_logs
+      # Host thermal zones, so sys_logger_node reports real board temperatures
+      # rather than the container's empty view of /sys.
+      - /sys/class/thermal:/sys/class/thermal:ro
+
+  # Full-fidelity recording of every topic. Enable with --profile record.
+  logger:
+    image: ros:jazzy-ros-base
+    container_name: core_logger
+    network_mode: "host"
+    ipc: "host"
+    restart: no
+    profiles: [ "record" ]
+    depends_on:
+      - brain
+    environment:
+      # "mcap" is the recommended ROS 2 storage format: faster to write,
+      # smaller, and readable by Foxglove without conversion.
+      - BAG_FORMAT=${BAG_FORMAT:-mcap}
+      # Anchored alternation regex of topics to skip, e.g.
+      # "^/payload/camera/image_raw$". A camera stream fills a disk in minutes.
+      - BAG_EXCLUDE_REGEX=${BAG_EXCLUDE_REGEX:-}
+    volumes:
+      - ${DATA_DIR:-../data}/rosbags:/app/backseat_ws/logs
+      - ./record-bag.sh:/record-bag.sh:ro
+    command: [ "/bin/bash", "/record-bag.sh" ]
+
+  # WebSocket bridge for live inspection from Foxglove on :8765. Useful over
+  # WiFi at the dock; too heavy for a metered cellular link.
+  foxglove_bridge:
+    image: blueboat-foxglove
+    build:
+      context: ../
+      dockerfile: deployment/Dockerfile.foxglove
+    container_name: core_foxglove
+    network_mode: "host"
+    ipc: "host"
+    restart: no
+
+  # Republishes ROS 2 topics over Zenoh so a remote dashboard can subscribe
+  # across the Internet. Zenoh routes over cellular NAT, where raw DDS
+  # discovery does not. Enable with --profile remote.
+  zenoh_bridge:
+    image: eclipse/zenoh-bridge-ros2dds:latest
+    container_name: core_zenoh_bridge
+    network_mode: "host"
+    ipc: "host"
+    restart: unless-stopped
+    profiles: [ "remote" ]

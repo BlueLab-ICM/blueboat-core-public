@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  tests:
+    name: Geometry and waypoint tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pytest
+      # These need no ROS: the geodetic helpers live in a ROS-free module and
+      # the waypoint generator is standard library only. That is deliberate —
+      # the geometry the geofence depends on should be checkable anywhere.
+      - run: pytest tests/ -v
+
+  build:
+    name: Build ${{ matrix.service }} image
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [ gateway, brain, foxglove ]
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          docker build -f deployment/Dockerfile.${{ matrix.service }} \
+            -t blueboat-${{ matrix.service }}:ci .

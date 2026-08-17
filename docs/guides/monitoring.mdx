@@ -1,0 +1,176 @@
+---
+title: "Monitoring"
+description: "What to watch while the boat is out, and over which link"
+---
+
+The stack publishes more than anyone needs to watch. This page is about what is worth watching, and what each signal actually tells you.
+
+## The three views
+
+<CardGroup cols={3}>
+  <Card title="Container logs" icon="terminal">
+    Status transitions and failures, in plain text over SSH. Works over any link.
+  </Card>
+  <Card title="Foxglove" icon="chart-line">
+    Live geometry and plots over WiFi. The development and debugging view.
+  </Card>
+  <Card title="Dashboard" icon="globe">
+    High-level supervision over cellular, via the Zenoh bridge. The field view.
+  </Card>
+</CardGroup>
+
+## Container logs
+
+The first thing to open, and often the only thing needed:
+
+```bash
+docker logs -f core_autonomy
+```
+
+The brain logs each status change with the context that matters:
+
+```
+Status: 'disabled' -> 'mission' [frontseat_mode='GUIDED' dist_from_home_m=0.0/80]
+Waypoint 1/16 reached.
+Waypoint 2/16 reached.
+```
+
+<Note>
+The status log is edge-triggered, so a quiet log means things are progressing normally — not that something has stalled. A 10 Hz loop logging every tick would be unreadable and would bury the transitions that matter.
+</Note>
+
+Lines worth recognising immediately:
+
+| Message | Meaning |
+|---------|---------|
+| `Refused: ArduPilot must be in GUIDED` | The operator has not handed over control. Working as designed. |
+| `Refused: N of M waypoints lie outside the ... geofence` | The pattern does not fit the fence. Fix before launching. |
+| `Boat is outside the geofence. Relaying disabled` | The boat left the boundary. Take manual control. |
+| `Mission complete: N waypoints reached` | Normal completion; relaying disabled itself. |
+| `FAILSAFE: Brain Heartbeat Lost!` (gateway) | The brain died or stalled. The lease is revoked. |
+| `SECURITY REJECT: Unauthorized node ...` (gateway) | A payload tried to command the vehicle. Fix the payload. |
+
+## Foxglove
+
+The best view at the dock and during development. The bridge runs on port 8765.
+
+<Steps>
+  <Step title="Connect">
+    Open [app.foxglove.dev](https://app.foxglove.dev) → **Open connection** → `ws://<backseat-ip>:8765`.
+  </Step>
+
+  <Step title="Add a 3D panel">
+    Enable `/system/brain/visualization`:
+
+    - **orange circle** — the geofence
+    - **blue points** — waypoints still to come
+    - **grey points** — waypoints already reached
+    - **blue sphere** — a payload's current target, when there is a live one
+    - **green arrow** — the boat, pointing along its heading; grey when relaying is off
+
+    Everything is drawn in a local frame centred on the geofence, which keeps the numbers readable compared to raw latitude and longitude.
+  </Step>
+
+  <Step title="Add plots">
+    `/frontseat/speed`, `/frontseat/yaw_rate` and `/frontseat/battery` show how the boat is actually behaving. A speed trace that keeps dropping to zero usually means it is fighting a current it cannot make headway against.
+  </Step>
+
+  <Step title="Add a diagnostics panel">
+    `/diagnostics` gives backseat CPU, memory, disk and temperature in a purpose-built panel.
+  </Step>
+</Steps>
+
+## Remote supervision
+
+```bash
+docker compose -f deployment/docker-compose.yml --profile remote up -d
+```
+
+The Zenoh bridge republishes ROS 2 topics over a routed protocol that survives cellular NAT — which plain DDS discovery does not.
+
+<Warning>
+Cellular is metered and the bridge carries everything published. Exclude camera streams and other high-rate topics, and prefer the recorded logs over live raw telemetry for anything that can wait until the boat is back.
+</Warning>
+
+## Brain status values
+
+`/system/brain/status`:
+
+| Value | Meaning |
+|-------|---------|
+| `disabled` | Relaying is off. The brain heartbeats but commands nothing. |
+| `mission` | Flying the loaded waypoint list. |
+| `mission_complete` | Last waypoint reached; relaying disabled itself. |
+| `relaying_waypoint` | Forwarding a payload position target. |
+| `relaying_velocity` | Forwarding a payload velocity target. |
+| `waiting_for_payload` | The payload has gone quiet; the boat is not being commanded. |
+| `target_rejected` | The payload's target lies outside the geofence. |
+| `geofence_stop` | The boat left the geofence; relaying disabled. |
+
+The last three are the ones to watch during payload development — they mean the safety net caught something.
+
+## Health signals
+
+<AccordionGroup>
+  <Accordion title="Backseat temperature" icon="temperature-half">
+    ```bash
+    ros2 topic echo /backseat/temperature
+    ```
+
+    A sealed hull in the sun throttles a Jetson before anything else fails, and it degrades gracefully enough to be easy to miss: inference rate drops, the control loop slows, and the boat behaves slightly worse than it did in the morning.
+
+    `/diagnostics` raises a `WARN` when CPU, memory or disk exceed 90%.
+  </Accordion>
+
+  <Accordion title="Container resources" icon="microchip">
+    ```bash
+    ros2 topic echo /system/container_stats
+    ```
+
+    Per-container CPU and memory, as CSV, every five seconds. A payload steadily climbing in memory across a long deployment is a leak that will end the run.
+  </Accordion>
+
+  <Accordion title="Disk space" icon="hard-drive">
+    ```bash
+    df -h
+    ```
+
+    Recording every topic including a camera stream fills a disk faster than most people expect, and a full disk stops the rosbag silently. Check before a long deployment, and exclude the camera with `BAG_EXCLUDE_REGEX`.
+  </Accordion>
+
+  <Accordion title="Flight mode" icon="toggle-on">
+    ```bash
+    ros2 topic echo /frontseat/mode
+    ```
+
+    The first thing to check when nothing is moving. If it does not read `GUIDED`, no backseat command is reaching the vehicle — and that is the system working correctly.
+  </Accordion>
+</AccordionGroup>
+
+## A practical routine
+
+<Steps>
+  <Step title="Before the run">
+    Confirm `/frontseat/gps` is publishing with a valid fix status, battery voltage is healthy, and disk space is sufficient.
+  </Step>
+  <Step title="At the start">
+    Watch `docker logs -f core_autonomy`. If enabling was refused, the log says exactly why.
+  </Step>
+  <Step title="During">
+    Foxglove if you have WiFi, the dashboard if you do not. Watch position against the geofence and keep an eye on battery.
+  </Step>
+  <Step title="If anything looks wrong">
+    Switch out of GUIDED. That is the whole procedure — it needs no working software on the backseat at all.
+  </Step>
+  <Step title="After">
+    Capture the container logs **before** bringing the stack down; `docker compose down` removes the containers and their logs go with them.
+
+    ```bash
+    for c in $(docker ps --format '{{.Names}}'); do docker logs "$c" &> "data/${c}.log"; done
+    ```
+  </Step>
+</Steps>
+
+<Card title="Working with what you recorded" icon="chart-simple" href="/guides/data-logging">
+  Rosbags, JSONL telemetry and what to do with them.
+</Card>

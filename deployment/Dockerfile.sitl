@@ -1,0 +1,89 @@
+# ArduPilot SITL — a simulated frontseat for testing the autonomy stack.
+#
+# Builds only the ArduRover binary: no Gazebo, no ROS, no physics renderer.
+# The result is real ArduPilot firmware running its real navigation, arming and
+# mode logic against a simple vehicle model, which is what is needed to
+# exercise the gateway, the brain and a mission end to end.
+#
+# Dependencies are installed explicitly rather than through ArduPilot's
+# Tools/environment_install/install-prereqs-ubuntu.sh. That script targets an
+# interactive developer workstation: it calls sudo, reads $USER (unset in a
+# docker RUN), adds the user to dialout, and pulls in cross-compilers and GUI
+# tooling that a headless SITL build never uses.
+#
+# The first build compiles ArduPilot and takes 15-30 minutes. It is cached
+# afterwards.
+#
+# If the build fails with "Could not resolve host: github.com", Docker BuildKit
+# is isolating the build from the host's DNS. Build with host networking:
+#     docker build --network=host -f deployment/Dockerfile.sitl -t blueboat-sitl .
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+# Pin to a released tag so a rebuild months from now produces the same
+# firmware. Rover-4.5 matches the ArduRover generation the BlueBoat ships with.
+ARG ARDUPILOT_TAG=Rover-4.5.7
+
+# Build toolchain plus the Python packages waf needs to configure and build.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    g++ \
+    gawk \
+    git \
+    libtool \
+    libxml2-dev \
+    libxslt1-dev \
+    make \
+    pkg-config \
+    python3 \
+    python3-dev \
+    python3-pip \
+    python3-setuptools \
+    && rm -rf /var/lib/apt/lists/*
+
+# empy must be 3.x — ArduPilot's build templates are incompatible with empy 4.
+RUN pip3 install --no-cache-dir \
+    "empy==3.3.4" \
+    future \
+    pexpect \
+    pyparsing \
+    numpy \
+    psutil
+
+# ArduPilot's waf build refuses to run as root.
+RUN useradd -m -s /bin/bash sitl
+USER sitl
+WORKDIR /home/sitl
+
+# HTTP/1.1 avoids the HTTP/2 stalls that intermittently break large clones with
+# submodules on some networks.
+RUN git config --global http.version HTTP/1.1 \
+    && git clone --depth 1 --branch ${ARDUPILOT_TAG} \
+       https://github.com/ArduPilot/ardupilot.git --recurse-submodules --shallow-submodules
+
+WORKDIR /home/sitl/ardupilot
+RUN ./waf configure --board sitl && ./waf build --target bin/ardurover
+
+# Simulation-only parameter overlay. See the file for what it does and, more
+# importantly, what it deliberately leaves alone.
+COPY deployment/sitl-defaults.parm /home/sitl/sitl-defaults.parm
+
+# Simulated home position, overridable at run time: latitude, longitude,
+# altitude in metres, and initial heading in degrees.
+ENV SITL_HOME="41.362628,2.186193,0,0"
+# Where the simulated autopilot sends its backseat MAVLink stream. With
+# network_mode: host this reaches the gateway on the same machine.
+ENV SITL_BACKSEAT_ENDPOINT="udpclient:127.0.0.1:14552"
+
+# serial0 is the backseat link, standing in for the wired connection between
+# the Navigator and the backseat computer. TCP 5760, which SITL opens by
+# default, is the operator link: point QGroundControl or
+# scripts/sim-set-mode.py at it, exactly as an RC transmitter or ground station
+# would command the real vehicle.
+CMD ["/bin/bash", "-c", "exec ./build/sitl/bin/ardurover \
+    -S --model rover-skid \
+    --home ${SITL_HOME} \
+    --defaults Tools/autotest/default_params/rover-skid.parm,/home/sitl/sitl-defaults.parm \
+    --serial0 ${SITL_BACKSEAT_ENDPOINT} \
+    -I0"]

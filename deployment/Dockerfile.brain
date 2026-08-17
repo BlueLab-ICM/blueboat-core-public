@@ -1,0 +1,28 @@
+# Autonomy brain: gateway keepalive, command relay, diagnostics, telemetry log.
+FROM ros:jazzy-ros-base
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-pip \
+    docker.io \
+    ros-jazzy-tf2-ros \
+    ros-jazzy-visualization-msgs \
+    && rm -rf /var/lib/apt/lists/*
+
+# psutil backs sys_logger_node's CPU/memory/temperature reporting.
+RUN pip3 install psutil --break-system-packages
+
+WORKDIR /app/backseat_ws
+
+# Bake the waypoint files in, so a mission still runs when the /workspace bind
+# mount is absent (see _load_waypoints in brain_node.py).
+COPY deployment/waypoints/ /opt/blueboat/waypoints/
+
+COPY src/core/core_autonomy/ src/core/core_autonomy/
+COPY src/interfaces/core_interfaces/ src/interfaces/core_interfaces/
+
+RUN /bin/bash -c "source /opt/ros/jazzy/setup.bash && colcon build"
+
+# All three nodes share one container. `wait -n` returns as soon as any of them
+# exits, so a crash in any single node takes the container down rather than
+# leaving a half-running stack whose heartbeat still holds the autonomy lease.
+CMD ["/bin/bash", "-c", "source /opt/ros/jazzy/setup.bash && source install/setup.bash && { ros2 run core_autonomy brain_node & ros2 run core_autonomy sys_logger_node & ros2 run core_autonomy telemetry_logger_node & wait -n; }"]

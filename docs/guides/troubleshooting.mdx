@@ -1,0 +1,271 @@
+---
+title: "Troubleshooting"
+description: "The failures that actually happen, and what each one means"
+---
+
+Most problems fall into a handful of patterns. Work down the page in order — the first two sections cover the majority.
+
+## The gateway cannot find the autopilot
+
+```
+RuntimeError: No MAVLink HEARTBEAT received within 60 s
+```
+
+The gateway waits for a heartbeat from the flight controller specifically, and will not start without one.
+
+<Steps>
+  <Step title="Is anything arriving at all?">
+    ```bash
+    sudo tcpdump -i any -n udp port 14550
+    ```
+
+    Silence means the problem is upstream: the BlueOS endpoint, the network, or the frontseat itself.
+  </Step>
+
+  <Step title="Check the BlueOS endpoint">
+    **Autopilot → MAVLink Endpoints** should contain a UDP Client entry pointing at the backseat's IP on port 14550.
+
+    Delete any stale entry pointing at an address the backseat no longer uses. A forgotten endpoint from a previous setup is the single most common cause of this failure.
+  </Step>
+
+  <Step title="Check the backseat's address">
+    ```bash
+    ip addr show
+    ```
+
+    If it has drifted from what BlueOS is sending to, make it static. [Network setup →](/hardware/backseat-computer#network)
+  </Step>
+
+  <Step title="Is it the wrong port?">
+    In simulation the gateway listens on **14552**, not 14550. If you started the simulation compose file and are watching 14550, you are watching the wrong port.
+  </Step>
+</Steps>
+
+<Note>
+Traffic on 14550 but no heartbeat accepted usually means only non-autopilot components are reaching the gateway. It requires component ID `AUTOPILOT1` **and** a rover or boat vehicle type — `mavlink2rest`, the camera manager and connected ground stations all share the same stream and are deliberately ignored.
+</Note>
+
+## Enabling autonomy is refused
+
+Every refusal explains itself in the service response. These are the ones you will meet.
+
+<AccordionGroup>
+  <Accordion title="ArduPilot must be in GUIDED" icon="lock">
+    ```
+    Refused: ArduPilot must be in GUIDED (current: 'MANUAL').
+    ```
+
+    **This is the system working.** Autonomy requires the operator to hand over control.
+
+    On a vehicle: select GUIDED on the RC transmitter or in QGroundControl. In simulation: `./scripts/sim-set-mode.py GUIDED`.
+
+    If GUIDED is selected but the message persists, check what the vehicle actually reports:
+
+    ```bash
+    ros2 topic echo /frontseat/mode
+    ```
+  </Accordion>
+
+  <Accordion title="No geofence centre" icon="location-dot">
+    ```
+    Refused: no geofence centre. Waiting for a valid GPS fix, or set
+    geofence_home_lat and geofence_home_lon explicitly.
+    ```
+
+    The boat has no usable position yet. ArduPilot publishes coordinates before its EKF converges, as (0, 0), and those are deliberately rejected — anchoring a fence on them would put the boundary in the Gulf of Guinea.
+
+    Wait for GPS lock, or set the centre explicitly.
+  </Accordion>
+
+  <Accordion title="No waypoints loaded" icon="file-circle-xmark">
+    ```
+    Refused: control_source is "mission" but no waypoints loaded
+    (waypoint_file='deployment/waypoints/typo.json').
+    ```
+
+    The file was not found or contained nothing usable. Paths resolve inside the container against `/workspace` — the bind-mounted repository root — so `deployment/waypoints/survey.json` is correct and an absolute host path is not.
+
+    ```bash
+    docker exec core_autonomy ls /workspace/deployment/waypoints/
+    ```
+  </Accordion>
+
+  <Accordion title="Waypoints outside the geofence" icon="circle-dot">
+    ```
+    Refused: 10 of 12 waypoints lie outside the 20 m geofence
+    (first is number 1). Widen geofence_radius_m or move the pattern.
+    ```
+
+    A configuration mismatch, caught before launch rather than a third of the way through the survey.
+
+    Either widen the fence, or check its **centre**: unless `geofence_home_lat`/`geofence_home_lon` are set, it centres on the first valid GPS fix — wherever the boat happened to be at startup, which may not be where the pattern was generated around.
+
+    ```bash
+    ./scripts/generate-waypoints.py lawnmower --lat ... --lon ... -o ...
+    # reports the furthest point; set geofence_radius_m above it
+    ```
+  </Accordion>
+
+  <Accordion title="Node not found" icon="plug-circle-xmark">
+    Usually the brain container is still starting — Python imports and DDS discovery take a few seconds after the container reports `Up`.
+
+    ```bash
+    docker logs core_autonomy
+    ```
+
+    If the node is genuinely running but the CLI cannot see it, the ros2 daemon is caching a partial graph. Run commands inside the node's own container and always pass `--no-daemon`.
+  </Accordion>
+</AccordionGroup>
+
+## Autonomy is enabled but the boat does not move
+
+<Steps>
+  <Step title="Is the vehicle still in GUIDED?">
+    ```bash
+    ros2 topic echo /frontseat/mode
+    ```
+
+    The gateway silently drops every command outside GUIDED, and leaving GUIDED also clears the brain's enable flag. This is the most common answer.
+  </Step>
+
+  <Step title="Is it armed?">
+    ```bash
+    docker logs core_gateway | grep -i arm
+    ```
+
+    `ArduPilot armed — autonomy ready` means it is. `Arm requested — retrying until ArduPilot prearm checks pass` repeating means a pre-arm check is failing; the reason appears in QGroundControl or the SITL console, not here.
+
+    Common in simulation: `3D Accel calibration needed`, which the bundled `deployment/sitl-defaults.parm` exists to fix.
+  </Step>
+
+  <Step title="Is the gateway holding a lease?">
+    ```bash
+    docker logs core_gateway | grep -i "lease\|failsafe"
+    ```
+
+    `Autonomy Lease Acquired` means commands can flow. `FAILSAFE: Brain Heartbeat Lost!` means they cannot.
+  </Step>
+
+  <Step title="What does the brain think it is doing?">
+    ```bash
+    ros2 topic echo /system/brain/status
+    ros2 topic echo /system/brain/command
+    ```
+
+    `waiting_for_payload` means your payload has gone quiet. `target_rejected` means it is asking for somewhere outside the fence.
+  </Step>
+</Steps>
+
+## It stops unexpectedly
+
+<AccordionGroup>
+  <Accordion title="Boat is outside the geofence" icon="circle-dot">
+    Relaying is disabled and the boat is handed back to the operator. Wind or current pushing it past the boundary while it worked near the edge is the usual cause — widen the fence or move the pattern inward.
+  </Accordion>
+
+  <Accordion title="Status shows waiting_for_payload" icon="plug-circle-exclamation">
+    Your payload stopped publishing within `payload_command_timeout_sec`. The safety net is working.
+
+    ```bash
+    docker logs payload_<name>
+    docker ps -a | grep payload      # did it exit?
+    ```
+
+    If the payload is alive but simply slow, raise the timeout — but understand you are lengthening the window in which a *dead* payload keeps the boat driving.
+  </Accordion>
+
+  <Accordion title="FAILSAFE: Brain Heartbeat Lost" icon="skull">
+    The brain crashed, stalled, or was starved of CPU.
+
+    ```bash
+    docker logs core_autonomy | tail -50
+    ros2 topic echo /system/container_stats
+    ```
+
+    A payload consuming the whole CPU can starve the executor. The `restart: no` policy is deliberate: a crashed brain stays down so the failure is unambiguous rather than silently bouncing.
+  </Accordion>
+</AccordionGroup>
+
+## Containers and networking
+
+<AccordionGroup>
+  <Accordion title="Nodes cannot see each other" icon="network-wired">
+    Almost always a missing `ipc: host`. ROS 2's DDS uses shared memory for same-machine transport, and without a shared IPC namespace containers cannot discover each other.
+
+    Every service — payloads included — needs both:
+
+    ```yaml
+    network_mode: "host"
+    ipc: "host"
+    ```
+  </Accordion>
+
+  <Accordion title="ros2 CLI reports a node as missing" icon="terminal">
+    The ros2 daemon caches a partial view of the graph across container boundaries.
+
+    Run commands **inside** the node's own container, and add `--no-daemon` plus an explicit message type when you must run them from elsewhere.
+  </Accordion>
+
+  <Accordion title="Build fails: Could not resolve host: github.com" icon="docker">
+    Docker BuildKit isolates the build from the host's DNS on some systems.
+
+    ```bash
+    docker build --network=host -f deployment/Dockerfile.sitl -t blueboat-sitl .
+    ```
+
+    If it is intermittent, retry — this failure mode is often transient.
+  </Accordion>
+
+  <Accordion title="A payload image is missing offshore" icon="wifi">
+    `docker build` needs the network, and cellular DNS frequently fails for BuildKit. Build everything at the dock:
+
+    ```bash
+    ./scripts/sync-payloads.sh
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Hardware
+
+<AccordionGroup>
+  <Accordion title="Performance degrades over a long deployment" icon="temperature-high">
+    Thermal throttling. A sealed hull in the sun is a poor environment for a 25 W computer, and it degrades gracefully enough to be easy to miss.
+
+    ```bash
+    ros2 topic echo /backseat/temperature
+    ros2 topic echo /diagnostics
+    ```
+  </Accordion>
+
+  <Accordion title="A serial device disappeared" icon="usb">
+    `/dev/ttyUSB0` is assigned in enumeration order and changes when another USB device is plugged in. Use a stable path:
+
+    ```bash
+    ls -l /dev/serial/by-id/
+    ```
+  </Accordion>
+
+  <Accordion title="The backseat is unresponsive" icon="power-off">
+    Power-cycle it with the solid-state relay from QGroundControl or the dashboard. That capability is why the relay is worth the wiring. [Power control →](/hardware/backseat-computer#power-control)
+  </Accordion>
+</AccordionGroup>
+
+## Diagnostic commands
+
+```bash
+docker ps
+docker logs core_gateway  | tail -30
+docker logs core_autonomy | tail -30
+
+docker exec -it core_autonomy bash
+source /opt/ros/jazzy/setup.bash
+ros2 topic list
+ros2 topic hz /frontseat/gps          # is telemetry flowing at all?
+ros2 param list /brain_node
+
+pytest tests/                          # configuration sanity, before the dock
+```
+
+## Getting help
+
+Open an issue on [GitHub](https://github.com/BlueLab-ICM/blueboat-core-public/issues) with what you ran, what happened, `docker logs` from both `core_gateway` and `core_autonomy`, and the output of `ros2 param list /brain_node`.

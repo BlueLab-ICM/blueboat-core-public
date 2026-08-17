@@ -1,0 +1,119 @@
+---
+title: "Sensors and payloads"
+description: "The instruments flown so far, and how to integrate your own"
+---
+
+The sensors below were chosen for specific research projects, not because the architecture requires them. They are worth describing because they show the range of what the platform absorbs — optical, acoustic, and radio — and because each one illustrates a different integration pattern.
+
+## Optical: machine-vision camera
+
+An Allied Vision Alvium U camera on a Sony IMX547 global-shutter sensor: 5.1 MP, 2.74 µm pixels, mounted inside a 2" Blue Robotics watertight enclosure on a mast about 50 cm above the deck. A printed bracket sets the tilt angle for the scenario.
+
+<Note>
+The global shutter is the part that matters. A rolling shutter on a boat produces skewed, smeared frames — a small vessel pitches and rolls continuously, and the distortion is worst exactly when the sea state is worst. Detection on a rolling-shutter image from a moving hull is a much harder problem than it needs to be.
+</Note>
+
+**Above water** the camera detects and localises small surface targets: pop-up buoys, marine wildlife, obstacles. In the field trials described in the paper, an onboard YOLO model produced 280 positive detections during a single run in which the vehicle repeatedly steered itself over a moored buoy, passing within 0.2 m of its known position — using vision alone, with the buoy's location never supplied to the boat.
+
+**Below water** the same camera supports benthic habitat mapping, including seagrass (*Posidonia oceanica*) coverage assessment.
+
+Integration: USB, on the Jetson, with inference in a payload container.
+
+## Acoustic: modem and hydrophone
+
+<CardGroup cols={2}>
+  <Card title="SeaTrac X010 modem" icon="satellite-dish">
+    Bidirectional underwater communication, ranging and tracking to roughly 1 km.
+
+    Talks to seafloor instruments and AUVs while simultaneously providing range measurements — which is what makes range-based localisation of an underwater target from a surface vehicle possible.
+
+    Integration: serial, via RS232-to-USB.
+  </Card>
+  <Card title="Cetacean Research C57" icon="waveform-lines">
+    A preamplified broadband hydrophone covering infrasonic through ultrasonic.
+
+    Passive acoustic monitoring of marine mammals, and detection of acoustic telemetry tags on animals.
+
+    Integration: audio input, with processing in a payload.
+  </Card>
+</CardGroup>
+
+The acoustic modem is the more interesting case architecturally: it is a sensor that produces *ranges to a moving target*, which is exactly the input an adaptive sampling algorithm needs. A payload consuming those ranges and publishing waypoints through `payload_waypoint` mode is a complete target-tracking system with no changes to the core stack.
+
+## Integrating your own
+
+The platform supports instruments through standard interfaces:
+
+| Interface | Typical instruments |
+|-----------|--------------------|
+| USB | cameras, GPS receivers, serial adapters |
+| Ethernet | high-bandwidth sensors, IP cameras, sonars |
+| Serial (RS232-to-USB) | acoustic modems, CTDs, most oceanographic instruments |
+| Coaxial (TNC) | antennas — six bulkhead connectors are fitted in the port-hull cover |
+
+CTDs, ADCPs, multibeam echosounders and water-quality probes all fit this pattern without hardware or software changes beyond a driver payload.
+
+### The integration pattern
+
+<Steps>
+  <Step title="Get it talking on the bench">
+    Read the instrument from a plain Python script on the backseat computer, outside Docker. Confirm the wiring, the baud rate and the protocol before ROS 2 is anywhere near the problem.
+  </Step>
+
+  <Step title="Wrap it in a payload">
+    Generate a repository from the [payload template](https://github.com/BlueLab-ICM/blueboat-payload-template) and move the read loop into a node that publishes under `/payload/<name>/`.
+
+    Pass the device through to the container:
+
+    ```yaml
+    services:
+      payload_ctd:
+        devices:
+          - "/dev/ttyUSB0:/dev/ttyUSB0"
+    ```
+
+    <Warning>
+    `/dev/ttyUSB0` is assigned in enumeration order and will change when another USB device is plugged in — usually on the day it matters. Use a stable path from `/dev/serial/by-id/` instead.
+    </Warning>
+  </Step>
+
+  <Step title="Prefer standard message types">
+    `sensor_msgs` has well-defined types for most things: `Temperature`, `FluidPressure`, `Imu`, `PointCloud2`, `Image`. Using them means the rosbag, Foxglove and every other payload can read your data without your interface package.
+  </Step>
+
+  <Step title="Close the loop, if you want to">
+    A payload that only records is useful. A payload that publishes to `/payload/waypoints/waypoint` steers the boat — with the geofence, the timeout and the staleness check applied on your behalf.
+
+    [Adding a payload →](/guides/adding-a-payload)
+  </Step>
+</Steps>
+
+## Practical notes
+
+<AccordionGroup>
+  <Accordion title="Power before compute" icon="bolt">
+    Add up the draw before adding the instrument. A Jetson at 25 W plus a camera plus a modem is a real fraction of the energy budget, and endurance is usually what limits a survey rather than compute.
+  </Accordion>
+
+  <Accordion title="Save data inside the container's volume" icon="floppy-disk">
+    Containers are ephemeral. Anything written outside a mounted volume disappears when the container is recreated, which will happen at the least convenient moment.
+
+    ```yaml
+    volumes:
+      - ${MISSION_CAMERA_DIR:-./data}:/app/saved_data
+    ```
+  </Accordion>
+
+  <Accordion title="Keep large data out of the rosbag" icon="database">
+    Recording a camera stream fills a disk in minutes. Exclude it from the bag and have the payload write frames itself, at a rate you choose:
+
+    ```bash
+    # deployment/.env
+    BAG_EXCLUDE_REGEX=^/payload/camera/image_raw$
+    ```
+  </Accordion>
+
+  <Accordion title="Test in simulation first" icon="flask">
+    A payload that reads `/frontseat/gps` and publishes waypoints can be developed entirely against the simulator, with the instrument replaced by synthetic data. Everything except the hardware driver is exercised on a laptop.
+  </Accordion>
+</AccordionGroup>

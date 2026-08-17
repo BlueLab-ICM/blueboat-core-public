@@ -1,0 +1,127 @@
+---
+title: "Parameters"
+description: "Every ROS 2 parameter and environment variable, with defaults"
+---
+
+Parameters are ordinary ROS 2 parameters — set them with `ros2 param set`, or load a block from a YAML file with `ros2 param load` if you keep per-site settings in version control.
+
+```bash
+docker exec -it core_autonomy bash
+source /opt/ros/jazzy/setup.bash
+ros2 param list /brain_node
+ros2 param set --no-daemon /brain_node geofence_radius_m 80.0
+```
+
+<Warning>
+Run these **inside** the node's own container and always pass `--no-daemon`. The ros2 CLI daemon caches a partial view of the DDS graph across container boundaries and will report a node as missing while it is answering perfectly well.
+</Warning>
+
+## brain_node
+
+### Control source
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `control_source` | string | `mission` | `mission`, `payload_waypoint` or `payload_velocity` |
+
+Exactly one source drives the boat at a time. An unrecognised value falls back to `mission` with a warning.
+
+### Waypoint missions
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `waypoint_file` | string | `""` | Path to the waypoint JSON |
+| `waypoint_reached_tolerance_m` | double | `4.0` | Arrival radius for advancing |
+| `mission_loop` | bool | `false` | Repeat the pattern instead of stopping |
+
+The file is loaded when autonomy is enabled, not at startup, so editing and re-enabling is the whole edit cycle. Relative paths resolve against `/workspace` (the bind-mounted repository) and then `/opt/blueboat/waypoints/` (the copy baked into the image).
+
+`waypoint_reached_tolerance_m` has a 0.5 m floor applied in code, so a value of `0` cannot stall the mission on GPS noise.
+
+### Geofence
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `geofence_home_lat` | double | `NaN` | Centre latitude |
+| `geofence_home_lon` | double | `NaN` | Centre longitude |
+| `geofence_radius_m` | double | `100.0` | Boundary radius in metres |
+
+<Note>
+Left as `NaN`, the centre is captured from the **first valid GPS fix** — so the boat is fenced relative to where it actually launched, with no configuration at all. Set both explicitly when the survey area is known in advance, otherwise the fence centres wherever the boat happened to be at startup.
+
+"Valid" excludes the (0, 0) placeholder ArduPilot publishes before its EKF converges.
+</Note>
+
+The radius is enforced three ways: a mission is refused if any waypoint falls outside it, a payload target outside it is refused individually, and relaying stops entirely if the boat itself leaves it.
+
+### Payload relaying
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `payload_command_timeout_sec` | double | `2.0` | Age at which a payload command is ignored |
+
+Set it to a few times the payload's publishing period: long enough to ride out a slow inference frame, short enough that a crashed payload stops the boat promptly.
+
+<Warning>
+Use a shorter timeout for `payload_velocity` — one second rather than two. Velocity commands are latched by the autopilot until superseded, so a stale one is actively dangerous in a way a stale waypoint is not.
+</Warning>
+
+## gateway_node
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `auto_arm` | bool | `true` | Request arming while the brain reports relaying enabled |
+
+Arming follows the brain's own enable flag, carried in the heartbeat. Set `auto_arm` false to keep arming strictly in the operator's hands:
+
+```bash
+ros2 param set --no-daemon /gateway_node auto_arm false
+```
+
+### Environment variables
+
+The gateway's connection settings come from the environment rather than parameters, because they must be known before the node can start.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAVLINK_PORT` | `14550` | UDP port to listen on. Simulation uses `14552` |
+| `GATEWAY_EXPECTED_SOURCE` | unset | Abort at startup unless the vehicle heartbeat comes from this address |
+
+<Warning>
+Set both when a simulator and a real vehicle might share a network. A gateway that quietly connects to the wrong autopilot is the most expensive failure in the system.
+</Warning>
+
+## telemetry_logger_node
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `session_name` | string | `telemetry` | Setting it opens a new log file; clearing it closes the current one |
+| `log_hz` | double | `5.0` | Records per second |
+
+Logging starts automatically at node startup. Set `session_name` to begin a new file, which is a convenient way to mark the start of a run:
+
+```bash
+ros2 param set --no-daemon /telemetry_logger_node session_name transect_3
+```
+
+## Compose environment
+
+Set these in `deployment/.env` or the shell.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DATA_DIR` | `../data` | Root of rosbag and telemetry output. Point it outside the repository |
+| `BAG_FORMAT` | `mcap` | `mcap` or `sqlite3` |
+| `BAG_EXCLUDE_REGEX` | unset | Anchored alternation regex of topics to skip, e.g. `^/payload/camera/image_raw$` |
+| `SITL_HOME` | `41.362628,2.186193,0,0` | Simulated start position: `lat,lon,alt,heading` |
+
+Compose profiles:
+
+| Profile | Adds |
+|---------|------|
+| `record` | The rosbag recorder |
+| `remote` | The Zenoh bridge for a remote dashboard |
+
+```bash
+docker compose -f deployment/docker-compose.yml --profile record up -d
+```

@@ -1,0 +1,216 @@
+---
+title: "Run it in simulation"
+description: "A complete waypoint mission on your laptop, with no vehicle and no autopilot hardware"
+---
+
+The whole stack runs against a simulated autopilot on a single machine. This is the fastest way to understand the architecture, and the right place to develop a payload before taking it near water.
+
+What runs is real ArduPilot firmware — the same navigation, arming and mode logic as the vehicle, compiled for software-in-the-loop against a simple hull model. There is no Gazebo and no physics renderer, because what needs testing here is the autonomy, not the hydrodynamics.
+
+## Requirements
+
+<CardGroup cols={3}>
+  <Card title="Docker" icon="docker">
+    Engine 20.10+ with the Compose plugin.
+  </Card>
+  <Card title="Disk" icon="hard-drive">
+    About 20 GB for the ArduPilot and ROS 2 images.
+  </Card>
+  <Card title="Patience, once" icon="clock">
+    The first build compiles ArduPilot: 15-30 minutes. After that, seconds.
+  </Card>
+</CardGroup>
+
+Linux and macOS both work. On Windows, use WSL 2.
+
+## Start the simulation
+
+```bash
+git clone https://github.com/BlueLab-ICM/blueboat-core-public.git
+cd blueboat-core-public
+
+docker compose -f deployment/docker-compose.yml \
+               -f deployment/docker-compose.sitl.yml up -d --build
+```
+
+Four containers come up:
+
+| Container | Role |
+|-----------|------|
+| `core_sitl` | ArduPilot SITL — the simulated frontseat |
+| `core_gateway` | MAVLink bridge and watchdog |
+| `core_autonomy` | Brain, diagnostics and telemetry logging |
+| `core_foxglove` | WebSocket bridge for live visualisation |
+
+Confirm the gateway found the autopilot:
+
+```bash
+docker logs core_gateway | grep "MAVLink Connected"
+# MAVLink Connected to Frontseat! (source=0, port=14552)
+```
+
+<Note>
+The simulation override repoints the gateway to UDP port **14552**. A real BlueOS frontseat broadcasts to 14550, so a gateway listening on 14552 cannot latch onto a physical vehicle that happens to be powered on nearby.
+</Note>
+
+<Accordion title="If the build fails with 'Could not resolve host: github.com'">
+Docker BuildKit isolates the build from the host's DNS on some systems. Build with host networking:
+
+```bash
+docker build --network=host -f deployment/Dockerfile.sitl -t blueboat-sitl .
+```
+
+If it is intermittent, simply retry — this failure mode is often transient.
+</Accordion>
+
+## Hand over control
+
+Autonomy is inert until an operator selects GUIDED. In the field that is an RC switch; here, a script plays the operator's part:
+
+```bash
+./scripts/sim-set-mode.py GUIDED
+```
+
+```
+Connecting to tcp:127.0.0.1:5762 ...
+Connected to system 1, component 1.
+Mode is now GUIDED.
+```
+
+<Note>
+If this reports that the mode did not change, ArduPilot is still waiting for its EKF and simulated GPS to converge. Wait about 30 seconds after starting and try again.
+
+Note the port: **5762**, not the usual 5760. SITL's `serial0` is redirected to the gateway over UDP, so the operator link is `SERIAL1` on 5762 — mirroring the real vehicle, where the ground station and the backseat reach the autopilot over genuinely separate links.
+</Note>
+
+## Run a waypoint mission
+
+Two things: point the brain at a waypoint file, then enable relaying.
+
+```bash
+docker exec core_autonomy bash -c "source /opt/ros/jazzy/setup.bash && \
+  ros2 param set --no-daemon /brain_node waypoint_file \
+      deployment/waypoints/lawnmower_survey.json && \
+  ros2 service call /system/enable_autonomy std_srvs/srv/SetBool '{data: true}'"
+```
+
+```
+Set parameter successful
+response:
+std_srvs.srv.SetBool_Response(success=True, message='Autonomy relaying enabled.')
+```
+
+The boat is now flying a 12-point lawnmower survey autonomously:
+
+```bash
+docker logs -f core_autonomy
+```
+
+```
+[brain_node]: Loaded 12 waypoints from /workspace/deployment/waypoints/lawnmower_survey.json.
+[brain_node]: Status: 'disabled' -> 'mission' [frontseat_mode='GUIDED' dist_from_home_m=0.0/100]
+[brain_node]: Waypoint 1/12 reached.
+[brain_node]: Waypoint 2/12 reached.
+```
+
+<Note>
+The geofence centres itself on the first valid GPS fix, so the boat is always fenced relative to where it actually started — no configuration needed. Set `geofence_home_lat` and `geofence_home_lon` when the survey area is known in advance.
+</Note>
+
+## Watch it work
+
+<Tabs>
+  <Tab title="Visualisation">
+    Open [app.foxglove.dev](https://app.foxglove.dev), choose **Open connection**, and enter:
+
+    ```
+    ws://localhost:8765
+    ```
+
+    Add a **3D** panel and enable `/system/brain/visualization`:
+
+    - **orange circle** — the geofence
+    - **blue points** — waypoints still to come
+    - **grey points** — waypoints already reached
+    - **green arrow** — the boat, pointing along its heading (grey when relaying is off)
+  </Tab>
+
+  <Tab title="Raw telemetry">
+    ```bash
+    docker exec -it core_autonomy bash
+    source /opt/ros/jazzy/setup.bash
+
+    ros2 topic echo /frontseat/gps
+    ros2 topic echo /system/brain/status
+    ros2 topic list
+    ```
+  </Tab>
+
+  <Tab title="Telemetry log">
+    ```bash
+    tail -f data/telemetry/telemetry_*.jsonl
+    ```
+
+    ```json
+    {"ts": "2026-08-17T11:14:44+00:00", "lat": 41.3628937, "lon": 2.1858876,
+     "heading_deg": 159.77, "speed_mps": 0.837, "frontseat_mode": "GUIDED",
+     "brain_status": "mission"}
+    ```
+  </Tab>
+</Tabs>
+
+## Try the safety model
+
+Simulation is the only place where it is sensible to break things deliberately.
+
+<AccordionGroup>
+  <Accordion title="Take back control mid-mission" icon="hand">
+    ```bash
+    ./scripts/sim-set-mode.py MANUAL
+    ```
+
+    The gateway stops forwarding immediately, and the brain drops its enable flag so that returning to GUIDED does not silently resume a mission you have stopped thinking about. This is what the RC switch does on the water.
+  </Accordion>
+
+  <Accordion title="Kill the autonomy" icon="skull">
+    ```bash
+    docker stop core_autonomy
+    ```
+
+    Within two seconds the gateway logs:
+
+    ```
+    FAILSAFE: Brain Heartbeat Lost! Autonomy lease revoked.
+    No further waypoint/velocity commands will be forwarded.
+    Take manual control via RC transmitter.
+    ```
+
+    Note what it does *not* do: it does not change the flight mode, does not disarm, and attempts no recovery of its own. It stops being an authority and hands the vehicle back.
+  </Accordion>
+
+  <Accordion title="Ask for a mission that does not fit" icon="circle-dot">
+    ```bash
+    docker exec core_autonomy bash -c "source /opt/ros/jazzy/setup.bash && \
+      ros2 param set --no-daemon /brain_node geofence_radius_m 20.0 && \
+      ros2 service call /system/enable_autonomy std_srvs/srv/SetBool '{data: true}'"
+    ```
+
+    ```
+    Refused: 10 of 12 waypoints lie outside the 20 m geofence (first is number 1).
+    Widen geofence_radius_m or move the pattern.
+    ```
+
+    Refusing up front beats starting the survey and aborting a third of the way through it.
+  </Accordion>
+</AccordionGroup>
+
+## Stop
+
+```bash
+docker compose -f deployment/docker-compose.yml \
+               -f deployment/docker-compose.sitl.yml down
+```
+
+<Card title="Next: on a real vehicle" icon="ship" href="/getting-started/on-the-vehicle">
+  What changes when there is a boat in the water.
+</Card>

@@ -1,0 +1,130 @@
+---
+title: "Scripts and commands"
+description: "Bringing the stack up, and the three helper scripts"
+---
+
+There is no mission-runner script. The stack is plain `docker compose`, and a mission is two ROS 2 calls — which keeps the moving parts visible rather than hidden behind a wrapper.
+
+## Running the stack
+
+<CodeGroup>
+
+```bash On a vehicle
+# Start (add --profile record for rosbag recording)
+docker compose -f deployment/docker-compose.yml --profile record up -d --build
+
+# Stop
+docker compose -f deployment/docker-compose.yml --profile record down
+```
+
+```bash In simulation
+docker compose -f deployment/docker-compose.yml \
+               -f deployment/docker-compose.sitl.yml up -d --build
+
+docker compose -f deployment/docker-compose.yml \
+               -f deployment/docker-compose.sitl.yml down
+```
+
+</CodeGroup>
+
+Profiles: `record` adds the rosbag recorder, `remote` adds the Zenoh bridge for a remote dashboard.
+
+<Note>
+Capture container logs **before** bringing the stack down. `docker compose down` removes the containers and their logs go with them — and those logs are frequently the only record of why a payload misbehaved.
+
+```bash
+for c in $(docker ps --format '{{.Names}}'); do docker logs "$c" &> "data/${c}.log"; done
+```
+</Note>
+
+## Running a mission
+
+```bash
+docker exec core_autonomy bash -c "source /opt/ros/jazzy/setup.bash && \
+  ros2 param set --no-daemon /brain_node waypoint_file deployment/waypoints/site_a.json && \
+  ros2 service call /system/enable_autonomy std_srvs/srv/SetBool '{data: true}'"
+```
+
+Stopping:
+
+```bash
+docker exec core_autonomy bash -c "source /opt/ros/jazzy/setup.bash && \
+  ros2 service call /system/enable_autonomy std_srvs/srv/SetBool '{data: false}'"
+```
+
+Or simply switch out of GUIDED, which stops everything within one control cycle and needs no working software on the backseat at all.
+
+## scripts/generate-waypoints.py
+
+```bash
+./scripts/generate-waypoints.py lawnmower --lat 41.362628 --lon 2.186193 \
+    --width 100 --height 80 --spacing 15 -o deployment/waypoints/site_a.json
+
+./scripts/generate-waypoints.py spiral --lat 41.362628 --lon 2.186193 \
+    --radius 50 --arm-spacing 10 -o deployment/waypoints/search.json
+```
+
+Generates survey patterns and reports the furthest point from the centre — the number `geofence_radius_m` must exceed. Standard library only, so it runs anywhere.
+
+[Waypoint missions →](/guides/waypoint-missions)
+
+## scripts/sim-set-mode.py
+
+```bash
+./scripts/sim-set-mode.py GUIDED
+./scripts/sim-set-mode.py MANUAL
+```
+
+Sets the flight mode on the **simulated** vehicle, standing in for the RC transmitter. Connects on the SITL operator link (TCP 5762), never on the backseat link the gateway uses.
+
+<Note>
+Port 5762, not the usual 5760: SITL's `serial0` is redirected to the gateway over UDP, so the operator link is `SERIAL1`. That separation mirrors the real vehicle, where the ground station and the backseat computer reach the autopilot over genuinely different links.
+</Note>
+
+Requires `pymavlink`. On a real vehicle, use the RC transmitter or QGroundControl.
+
+## scripts/sync-payloads.sh
+
+```bash
+./scripts/sync-payloads.sh [--force]
+```
+
+Clones or updates every enabled payload from `deployment/payload-registry.yaml` into `src/payloads/`, and pre-builds its Docker image. Prefers a payload's Jetson-specific compose file when running on a Jetson.
+
+`--force` resets checkouts to the registry version, printing what it is about to discard first — a payload checkout on a vehicle may hold the only copy of a field fix.
+
+<Warning>
+Run this at the dock. `docker build` needs the network, and BuildKit DNS frequently fails over cellular.
+</Warning>
+
+## scripts/register-payload.sh
+
+```bash
+./scripts/register-payload.sh <payload-name> <github-org>
+```
+
+For **private** payload repositories. Generates an SSH deploy key scoped to that one repository, adds a matching host alias to `~/.ssh/config`, and appends a registry entry. Prints the public key to add on GitHub.
+
+One key per payload is deliberate: a vehicle that is lost or compromised exposes only the payloads installed on it, not the whole organisation.
+
+Public repositories need none of this — put the `https://` URL straight into `deployment/payload-registry.yaml`.
+
+## Tests
+
+```bash
+pytest tests/
+```
+
+| File | Checks | Needs ROS |
+|------|--------|-----------|
+| `test_waypoints.py` | Coordinate conversion, pattern geometry, the bundled waypoint files | no |
+| `test_geometry.py` | The brain's geodetic helpers, which the geofence rests on | yes |
+
+The ROS-dependent tests skip themselves on a plain laptop. Run the full set inside the brain container:
+
+```bash
+docker exec -it core_autonomy bash -c \
+    "cd /workspace && python3 -m pytest tests/ -v"
+```
+
+Run them before leaving the dock — a pattern that does not fit its fence is caught here rather than halfway through a survey.
