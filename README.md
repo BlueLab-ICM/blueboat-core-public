@@ -6,7 +6,7 @@ BlueBoat Core adds a **backseat computer** to a stock BlueBoat: a second embedde
 
 It is deliberately small. You get waypoint missions, a safety envelope, logging, monitoring, a simulator, and a payload mechanism for your own code — and not much else. It is a foundation to build on, not a finished autonomy suite.
 
-> Developed by the [BLUE Lab](https://bluelab.icm.csic.es/) at the Institut de Ciències del Mar (ICM-CSIC), Barcelona. It accompanies the OCEANS 2026 Monterey paper *An adaptive open-source architecture for enhanced autonomy in BlueBoat ASVs based on ROS2*. If you use it in your research, please [cite the paper](#citation).
+> Developed by the BLUE Lab at the Institut de Ciències del Mar (ICM-CSIC), Barcelona. It accompanies the OCEANS 2026 Monterey paper *An adaptive open-source architecture for enhanced autonomy in BlueBoat ASVs based on ROS2*. If you use it in your research, please [cite the paper](#citation).
 
 📚 **[Documentation](https://bluelab-icm.mintlify.site)** · 🧩 **[Payload template](https://github.com/BlueLab-ICM/blueboat-payload-template)**
 
