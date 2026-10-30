@@ -34,7 +34,7 @@ Every other node in the system — including the brain, and including every payl
 
 <Steps>
   <Step title="The sender must be authorised">
-    A `Command` message whose `source_node` is not `core_autonomy` is logged and dropped. Payloads can see the topic; they cannot use it.
+    A `Command` message whose `source_node` is not `core_executive` is logged and dropped. Payloads can see the topic; they cannot use it.
   </Step>
   <Step title="The vehicle must be in GUIDED">
     The gateway reads ArduPilot's mode from telemetry. Outside GUIDED, no waypoint and no velocity is forwarded.

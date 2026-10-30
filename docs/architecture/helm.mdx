@@ -1,0 +1,36 @@
+---
+title: "Helm"
+description: "The single command path between every source and the gateway."
+---
+
+The helm is the only node that publishes `/helm/output`. Each tick at 10 Hz it takes the vehicle state and the latest requests and returns one command. Its rules live in `core_helm/rules.py`, free of ROS, and are tested without a vehicle.
+
+## Engagement
+
+The executive calls `/helm/engage` with a fence and optional limits. The helm refuses unless the autopilot is in GUIDED, GPS is fresh and the vehicle is inside the fence. While engaged, the executive republishes `/helm/grant` at 10 Hz, naming the source that may drive.
+
+## What each tick checks
+
+| Check | Result |
+| --- | --- |
+| Autopilot left GUIDED | Engagement ends: the operator took over. |
+| No fresh GPS | Thrusters stop. After `stale_stop_s` the engagement ends. |
+| Past the abort radius | Engagement ends, zero velocity for 10 ticks. |
+| Grant or setpoint stale | Holds where it is. After `stale_stop_s` the engagement ends. |
+| Target outside the fence | That target is refused and the vehicle holds. |
+| Velocity over a limit | Clamped. |
+| Conflict with a peer | The collision filter replaces the command. |
+
+## Sources
+
+A source publishes `core_interfaces/Setpoint` on `/helm/setpoint` with its name in `source`. Only the granted source is relayed. `source` is a label: it stops mistakes, not a hostile node on the same ROS domain.
+
+## Collision avoidance
+
+Each vehicle has its own ROS domain, so peers are heard over the fleet link: small UDP datagrams, sent to the hosts in `FLEET_PEERS`. The helm checks the closest point of approach over `horizon_s`. On a conflict it picks the velocity nearest the wanted one that clears every peer, preferring a turn to starboard, and holds that override until the way has been clear for `clear_s`. An old report is dead-reckoned and its radius widened. A peer not heard for `peer_timeout_s` is dropped.
+
+The filter is in the helm and not in a behaviour tree because it must hold when the tree or a policy fails. Every override is logged, and the mission check reports it, because a trial steered by the filter is not a clean trial.
+
+## Parameters
+
+See `config/helm.yaml`.

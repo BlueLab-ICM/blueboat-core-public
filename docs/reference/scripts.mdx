@@ -40,7 +40,7 @@ for c in $(docker ps --format '{{.Names}}'); do docker logs "$c" &> "data/${c}.l
 ## Running a mission
 
 ```bash
-docker exec core_autonomy bash -c "source /opt/ros/jazzy/setup.bash && \
+docker exec core_executive bash -c "source /opt/ros/jazzy/setup.bash && \
   ros2 param set --no-daemon /brain_node waypoint_file deployment/waypoints/site_a.json && \
   ros2 service call /system/enable_autonomy std_srvs/srv/SetBool '{data: true}'"
 ```
@@ -48,7 +48,7 @@ docker exec core_autonomy bash -c "source /opt/ros/jazzy/setup.bash && \
 Stopping:
 
 ```bash
-docker exec core_autonomy bash -c "source /opt/ros/jazzy/setup.bash && \
+docker exec core_executive bash -c "source /opt/ros/jazzy/setup.bash && \
   ros2 service call /system/enable_autonomy std_srvs/srv/SetBool '{data: false}'"
 ```
 
@@ -89,7 +89,7 @@ Requires `pymavlink`. On a real vehicle, use the RC transmitter or QGroundContro
 ./scripts/sync-payloads.sh [--force]
 ```
 
-Clones or updates every enabled payload from `deployment/payload-registry.yaml` into `src/payloads/`, and pre-builds its Docker image. Prefers a payload's Jetson-specific compose file when running on a Jetson.
+Clones or updates every enabled payload from `deployment/module-registry.yaml` into `src/payloads/`, and pre-builds its Docker image. Prefers a payload's Jetson-specific compose file when running on a Jetson.
 
 `--force` resets checkouts to the registry version, printing what it is about to discard first — a payload checkout on a vehicle may hold the only copy of a field fix.
 
@@ -107,7 +107,7 @@ For **private** payload repositories. Generates an SSH deploy key scoped to that
 
 One key per payload is deliberate: a vehicle that is lost or compromised exposes only the payloads installed on it, not the whole organisation.
 
-Public repositories need none of this — put the `https://` URL straight into `deployment/payload-registry.yaml`.
+Public repositories need none of this — put the `https://` URL straight into `deployment/module-registry.yaml`.
 
 ## Tests
 
@@ -123,7 +123,7 @@ pytest tests/
 The ROS-dependent tests skip themselves on a plain laptop. Run the full set inside the brain container:
 
 ```bash
-docker exec -it core_autonomy bash -c \
+docker exec -it core_executive bash -c \
     "cd /workspace && python3 -m pytest tests/ -v"
 ```
 

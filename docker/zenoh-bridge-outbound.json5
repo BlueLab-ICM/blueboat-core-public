@@ -1,0 +1,26 @@
+{
+  // zenoh-bridge-ros2dds configuration: bridge ROS 2 publishers OUT to Zenoh
+  // only. We deny bridging of ROS 2 *subscribers* so the bridge never creates a
+  // Zenoh->ROS route that re-injects a ROS-originated topic back into ROS.
+  //
+  // Why: any topic that has BOTH a local ROS publisher (e.g. gateway_node ->
+  // /frontseat/gps) and a local ROS subscriber (e.g. rl_policy_node) would
+  // otherwise get a SECOND publisher — the bridge itself, appearing as
+  // "_CREATED_BY_BARE_DDS_APP_" — forming a feedback loop that corrupts the CDR
+  // frames ("sequence size exceeds remaining buffer") and drops the topic. The
+  // dashboard only needs telemetry flowing ROS->Zenoh (outbound), and in-domain
+  // ROS nodes already talk to each other natively, so denying subscriber
+  // bridging is both safe and necessary. See deployment note in the dashboard.
+  plugins: {
+    ros2dds: {
+      allow: {
+        publishers: [".*"],
+        subscribers: ["a^"],        // never-match regex => no Zenoh->ROS routes
+        service_servers: [".*"],
+        service_clients: [".*"],
+        action_servers: [".*"],
+        action_clients: [".*"],
+      },
+    },
+  },
+}

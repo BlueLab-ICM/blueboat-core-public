@@ -1,0 +1,4 @@
+# Module and application repos this vehicle can run. Entries are added by
+# scripts/modules/register-module.sh; set `version` to pin a branch or tag. Which ones start:
+# modules and application in mission-config.yaml.
+modules: []

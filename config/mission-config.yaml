@@ -1,0 +1,14 @@
+mission_metadata:
+  name: "mission"
+
+# The directory under src/modules with mission trees for this vehicle. Empty runs the built-in
+# survey: waypoints, optionally one skill.
+application: ""
+
+recording:
+  enabled: true
+  format: "mcap"  # "mcap" or "sqlite3"
+  split_seconds: 300
+  exclude_topics: []
+
+modules: []

@@ -1,0 +1,15 @@
+# Where a mission's output goes. start-mission.sh adds this file on top of docker-compose.yml;
+# a container started without it keeps nothing on the host.
+
+services:
+  executive:
+    volumes:
+      - ${MISSION_EXPERIMENT_LOG_DIR:?set by start-mission.sh}:/app/backseat_ws/experiment_logs
+
+  ops:
+    volumes:
+      - ${MISSION_EXPERIMENT_LOG_DIR:?set by start-mission.sh}:/app/backseat_ws/experiment_logs
+
+  logger:
+    volumes:
+      - ${MISSION_ROSBAG_DIR:?set by start-mission.sh}:/app/backseat_ws/logs

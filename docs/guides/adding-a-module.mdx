@@ -1,0 +1,41 @@
+---
+title: "Adding a module"
+description: "Add a sensor, a perception step or a skill without touching the core."
+---
+
+Generate a repository from `blueboat-payload-template` and run `./setup-module.sh <name>`.
+
+## Kinds
+
+| Kind | Does | May request motion |
+| --- | --- | --- |
+| driver | Wraps a device. Publishes under `/sensors/<name>/`. | no |
+| perception | Turns data into data. Publishes under `/perception/`. | no |
+| skill | Serves `/skills/<name>`. | yes, through the helm, while granted |
+| service | Anything else a mission needs. | no |
+
+## Contract
+
+- Name topics after the data. A consumer should not need to know which module produced them.
+- Prefer standard messages, so nothing else has to build your package.
+- Report health with `ModuleHealth`. Copy `health.py` from the template unchanged.
+- List every topic in `manifest.yaml`. CI runs `scripts/dev/check-manifest.py`, which compares it with the code.
+- Never publish under `/frontseat`, `/helm/output`, `/helm/grant` or `/executive`.
+
+## Data
+
+Set `data.mission_dir` in the manifest. `start-mission.sh` creates that folder in the mission and passes it as `MODULE_DATA_DIR`. For data that outlives a mission, set `data.shared_dir` and read `MODULE_SHARED_DIR`.
+
+## Skills
+
+Base the image on `blueboat-core` for its interfaces. Serve `core_interfaces/RunSkill` on `/skills/<name>`, publish `Setpoint` on `/helm/setpoint` with `source` set to your name, and send feedback while running: a silent skill is treated as dead. Run it from a plan:
+
+```json
+{"name": "my_run", "home": [41.0, 2.0],
+ "geofence": {"lat": 41.0, "lon": 2.0, "radius_m": 100.0},
+ "skill": "my_module", "skill_params": {}, "skill_timeout_s": 120.0}
+```
+
+## Install
+
+Add it to `config/module-registry.yaml`, or run `scripts/modules/register-module.sh`, then `scripts/modules/sync-modules.sh`. List it under `modules` in `config/mission-config.yaml`.

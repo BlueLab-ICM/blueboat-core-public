@@ -2,20 +2,17 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>core_gateway</name>
-  <version>1.0.0</version>
-  <description>
-    MAVLink gateway between the ROS 2 backseat and the ArduPilot frontseat.
-    The only node authorised to command the vehicle.
-  </description>
-  <maintainer email="bluelab@icm.csic.es">BLUE Lab, ICM-CSIC</maintainer>
-  <license>MIT</license>
-  <url type="repository">https://github.com/BlueLab-ICM/blueboat-core-public</url>
+  <version>0.0.0</version>
+  <description>TODO: Package description</description>
+  <maintainer email="admin@todo.todo">admin</maintainer>
+  <license>TODO: License declaration</license>
 
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
   <depend>sensor_msgs</depend>
-  <depend>geometry_msgs</depend>
+  <depend>diagnostic_msgs</depend>
   <depend>core_interfaces</depend>
+  <depend>core_common</depend>
 
   <test_depend>python3-pytest</test_depend>
 

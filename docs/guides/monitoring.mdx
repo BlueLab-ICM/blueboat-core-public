@@ -24,7 +24,7 @@ The stack publishes more than anyone needs to watch. This page is about what is 
 The first thing to open, and often the only thing needed:
 
 ```bash
-docker logs -f core_autonomy
+docker logs -f core_executive
 ```
 
 The brain logs each status change with the context that matters:
@@ -124,7 +124,7 @@ The last three are the ones to watch during payload development — they mean th
 
   <Accordion title="Container resources" icon="microchip">
     ```bash
-    ros2 topic echo /system/container_stats
+    ros2 topic echo /ops/container_stats
     ```
 
     Per-container CPU and memory, as CSV, every five seconds. A payload steadily climbing in memory across a long deployment is a leak that will end the run.
@@ -154,7 +154,7 @@ The last three are the ones to watch during payload development — they mean th
     Confirm `/frontseat/gps` is publishing with a valid fix status, battery voltage is healthy, and disk space is sufficient.
   </Step>
   <Step title="At the start">
-    Watch `docker logs -f core_autonomy`. If enabling was refused, the log says exactly why.
+    Watch `docker logs -f core_executive`. If enabling was refused, the log says exactly why.
   </Step>
   <Step title="During">
     Foxglove if you have WiFi, the dashboard if you do not. Watch position against the geofence and keep an eye on battery.

@@ -24,13 +24,13 @@ string string_param
 float64[] float_params
 ```
 
-Published on `/system/brain/command` by `brain_node`, consumed by `gateway_node`.
+Published on `/helm/output` by `brain_node`, consumed by `gateway_node`.
 
 ### Fields
 
 | Field | Purpose |
 |-------|---------|
-| `source_node` | Must be `"core_autonomy"`. The gateway drops anything else and logs it. |
+| `source_node` | Must be `"core_executive"`. The gateway drops anything else and logs it. |
 | `timestamp` | Optional sender timestamp. Unused by the gateway. |
 | `command_type` | One of the constants below. |
 | `string_param` | `ENABLED` or `DISABLED` on a `CMD_MODE` heartbeat. |
@@ -60,7 +60,7 @@ Published on `/system/brain/command` by `brain_node`, consumed by `gateway_node`
 </AccordionGroup>
 
 <Warning>
-Publishing a `Command` from a payload does not work. The gateway checks `source_node` and drops anything that is not `core_autonomy`, logging the attempt loudly enough to find later in a bag.
+Publishing a `Command` from a payload does not work. The gateway checks `source_node` and drops anything that is not `core_executive`, logging the attempt loudly enough to find later in a bag.
 
 Use `/payload/waypoints/waypoint` with `control_source: payload_waypoint` instead. That is not a lesser path — it is the one that gives your algorithm a geofence and a staleness check.
 </Warning>

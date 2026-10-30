@@ -1,96 +1,79 @@
-"""
-Core MAVLink Gateway Node
+"""Bridge between the backseat and the frontseat autopilot (ArduRover over MAVLink).
 
-This node acts as the bridge between backseat (payloads) and the frontseat (blueboat).
-1. Translates ROS 2 commands into MAVLink packets for the Frontseat (ArduRover).
-2. Streams physical telemetry (GPS, Heading, Speed, Yaw Rate, Battery) to the ROS 2 network.
-3. Enforces the Hardware Watchdog: if the Brain node dies, revokes the autonomy lease.
-4. Acts as a Security Gate, rejecting commands from unauthorized ROS namespaces.
-5. Translates Twist velocity commands into MAVLink body-frame velocity requests.
+Publishes autopilot telemetry on /frontseat/*, forwards the helm's output under the
+rules in core_gateway.safety, and revokes the autonomy lease when the helm goes
+silent. The backseat never sets the autopilot mode; the operator does.
 
-ArduPilot mode is NEVER set by the backseat. GUIDED must be set by the operator
-via RC transmitter or GCS. The gateway only reads mode from HEARTBEAT telemetry.
+It also sets the autopilot's home on request (/frontseat/set_home), reports the home
+and the link-loss failsafe parameters (/frontseat/home, /frontseat/failsafe), the
+autopilot's GPS time (/frontseat/time) and one parameter snapshot (/frontseat/params).
 """
 
+import json
+import math
 import os
 import time
+
 import rclpy
-from rclpy.node import Node
-
-# --- ROS 2 Message Types ---
-from sensor_msgs.msg import NavSatFix, NavSatStatus, BatteryState, Temperature
-from geometry_msgs.msg import Twist
-from std_msgs.msg import Float64, String
-from core_interfaces.msg import Command
-
+from core_common.geodesy import haversine_m
+from core_common.health import ERROR, OK, WARN, ModuleHealth
+from core_interfaces.msg import Setpoint
 from pymavlink import mavutil
+from rclpy.clock import Clock, ClockType
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import BatteryState, NavSatFix, NavSatStatus, Temperature, TimeReference
+from std_msgs.msg import Float64, Int32MultiArray, String
 
-# ArduRover mode name → custom_mode integer (MAV_TYPE_GROUND_ROVER = 10).
-# pymavlink's set_mode_apm relies on the HEARTBEAT's mav_type being correctly
-# identified; if that lookup fails it prints "Unknown mode" and no-ops.
-# Using explicit integers avoids that fragility entirely.
-_ROVER_MODE = {
-    'MANUAL': 0,
-    'ACRO': 1,
-    'STEERING': 3,
-    'HOLD': 4,
-    'LOITER': 5,
-    'FOLLOW': 6,
-    'SIMPLE': 7,
-    'AUTO': 10,
-    'RTL': 11,
-    'SMART_RTL': 12,
-    'GUIDED': 15,
-}
-_ROVER_MODE_NAME_BY_NUM = {value: key for key, value in _ROVER_MODE.items()}
+from core_gateway.params import ParamCollector
+from core_gateway.safety import ROVER_MODE_NAME_BY_NUM, AutonomyLease
+
+LATCHED = QoSProfile(
+    depth=1,
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+)
+# Parameters that decide what the autopilot does when the base-station link drops.
+FAILSAFE_PARAMS = ('FS_GCS_ENABLE', 'FS_ACTION', 'FS_GCS_TIMEOUT', 'FS_TIMEOUT')
+# A requested home farther than this from the vessel is refused as a typo.
+MAX_HOME_DISTANCE_M = 1000.0
 
 
 class GatewayNode(Node):
-    def __init__(self):
+    """Sole holder of vehicle-command authority: nothing else may talk to the autopilot."""
+
+    def __init__(self) -> None:
         super().__init__('gateway_node')
-        self.get_logger().info("Initializing Gateway...")
+        self.get_logger().info('Initializing Gateway...')
 
-        # --- ROS Parameters ---
-        # Auto-arm the frontseat when the Brain is active and the desired
-        # mode is something other than HOLD. Set false on real-boat
-        # deployments where arming must be operator-gated.
-        self.declare_parameter('auto_arm', True)
-
-        # --- MAVLink Connection ---
-        # GATEWAY_EXPECTED_SOURCE (env var): if set, the gateway aborts at
-        # startup when the first vehicle HEARTBEAT does not come from this IP.
-        # Use in sim mode (GATEWAY_EXPECTED_SOURCE=$LAPTOP_IP) so the gateway
-        # fails fast rather than silently arming the real Navigator if BlueOS
-        # is running alongside the SITL.
+        # In sim, abort if the first autopilot HEARTBEAT comes from another IP, so a
+        # BlueOS running alongside the SITL cannot be commanded by mistake.
         _expected_source = os.environ.get('GATEWAY_EXPECTED_SOURCE', '').strip()
 
-        # MAVLINK_PORT (env var): UDP port to listen on for MAVLink traffic.
-        # Default 14550 (real boat / BlueOS Navigator HAT default).
-        # Set to 14552 in sim mode (start-simulated-mission.sh) so the real
-        # frontseat Pi, which sends to 14550, can never reach this gateway
-        # even when both are on the same network.
+        # 14550 on the boat (BlueOS default); 14552 in sim, so the real frontseat
+        # cannot reach a sim gateway on the same network.
         _port = int(os.environ.get('MAVLINK_PORT', '14550'))
         self.boat = mavutil.mavlink_connection(f'udpin:0.0.0.0:{_port}')
 
-        # Wait for the autopilot's HEARTBEAT specifically. The BlueOS MAVLink
-        # router forwards every component's heartbeats to this endpoint —
-        # mavlink2rest (sysid 1, comp 194, ONBOARD_CONTROLLER), the camera
-        # manager (comps 100-105, CAMERA) and GCSes all share the stream, and
-        # their heartbeats carry custom_mode = 0. Locking onto one of those
-        # makes the gateway report MANUAL forever and address commands to the
-        # wrong component, so require the flight controller's component id
-        # (AUTOPILOT1) and a rover/boat vehicle type (SITL reports
-        # GROUND_ROVER, the real BlueBoat SURFACE_BOAT).
-        _VEHICLE_TYPES = (mavutil.mavlink.MAV_TYPE_SURFACE_BOAT,
-                          mavutil.mavlink.MAV_TYPE_GROUND_ROVER)
+        # Lock onto the flight controller only: BlueOS also forwards heartbeats from
+        # mavlink2rest, cameras and GCSes, whose custom_mode 0 reads as MANUAL.
+        # SITL reports GROUND_ROVER, the real BlueBoat SURFACE_BOAT.
+        _VEHICLE_TYPES = (  # noqa: N806 - local constant
+            mavutil.mavlink.MAV_TYPE_SURFACE_BOAT,
+            mavutil.mavlink.MAV_TYPE_GROUND_ROVER,
+        )
         while True:
             msg = self.boat.recv_match(type='HEARTBEAT', blocking=True, timeout=60)
             if msg is None:
                 raise RuntimeError(
                     'No MAVLink HEARTBEAT received within 60 s — '
-                    'is ArduPilot / SITL running and forwarding to UDP:14550?')
-            if (msg.get_srcComponent() == mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1
-                    and msg.type in _VEHICLE_TYPES):
+                    'is ArduPilot / SITL running and forwarding to UDP:14550?'
+                )
+            if (
+                msg.get_srcComponent() == mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1
+                and msg.type in _VEHICLE_TYPES
+            ):
                 self.boat.target_system = msg.get_srcSystem()
                 self.boat.target_component = msg.get_srcComponent()
                 break
@@ -99,85 +82,82 @@ class GatewayNode(Node):
         if _expected_source:
             if _connected_ip in ('unknown', '0', ''):
                 self.get_logger().warning(
-                    f"GATEWAY_EXPECTED_SOURCE={_expected_source!r} is set, but "
-                    f"connected MAVLink source is {_connected_ip!r}. "
-                    "Skipping strict source verification.")
+                    f'GATEWAY_EXPECTED_SOURCE={_expected_source!r} is set, but '
+                    f'connected MAVLink source is {_connected_ip!r}. '
+                    'Skipping strict source verification.'
+                )
             elif _connected_ip != _expected_source:
                 raise RuntimeError(
-                    f"Connected to MAVLink source {_connected_ip!r} but "
-                    f"GATEWAY_EXPECTED_SOURCE={_expected_source!r}. "
-                    "Stop BlueOS / real Navigator before running in sim mode.")
+                    f'Connected to MAVLink source {_connected_ip!r} but '
+                    f'GATEWAY_EXPECTED_SOURCE={_expected_source!r}. '
+                    'Stop BlueOS / real Navigator before running in sim mode.'
+                )
 
         self.get_logger().info(
-            f"MAVLink Connected to Frontseat! (source={_connected_ip}, port={_port})")
+            f'MAVLink Connected to Frontseat! (source={_connected_ip}, port={_port})'
+        )
 
-        # Request telemetry streams needed by payloads and the brain:
-        # - POSITION:        GLOBAL_POSITION_INT for GPS + heading
-        # - EXTRA1:          VFR_HUD for groundspeed
-        # - EXTRA2:          ATTITUDE for IMU yaw rate
-        # - EXTENDED_STATUS: GPS_RAW_INT for the satellite fix quality
-        # This keeps frontseat/speed and frontseat/yaw_rate sourced from
-        # ArduPilot (SITL or hardware), not from any simulator physics.
+        # Speed and yaw rate come from ArduPilot (SITL or hardware), not Gazebo.
         self._request_required_streams()
 
-        # --- Internal State ---
-        self.autonomy_active = False
-        self.last_heartbeat_time = time.time()
+        self.lease = AutonomyLease()
 
-        # Latest GPS fix quality, from GPS_RAW_INT.fix_type. GLOBAL_POSITION_INT
-        # carries no fix quality of its own and is published even before the EKF
-        # has a position — as (0, 0). Stamping every NavSatFix with the real fix
-        # status lets the brain and every payload tell a position from a
-        # placeholder, instead of each having to guess.
-        self._gps_fix_type = 0
+        self._actual_mode_num = None  # from HEARTBEAT.custom_mode; never written by us
 
-        # Arming state reconciliation. `_actual_armed` is driven by the
-        # SAFETY_ARMED bit in incoming HEARTBEATs; `_desired_armed` is set
-        # by mode transitions (True when entering any autonomy mode, False
-        # only on watchdog failsafe). The 1 Hz watchdog retries arm requests
-        # until the two agree, which covers SITL prearm checks that can take
-        # a few seconds to pass after EKF init.
-        self._actual_armed = False
-        self._desired_armed = False
-        self._last_arm_attempt_t = 0.0
-        self._arm_confirmed_logged = False  # one-shot: suppress repeat "armed" messages
-        # `_actual_mode_num` is read from HEARTBEAT.custom_mode and used to
-        # gate waypoint/velocity forwarding (GUIDED-only) and lease acquisition.
-        # The backseat never writes the mode register — ArduPilot mode is set
-        # exclusively by the operator via RC transmitter or GCS.
-        self._actual_mode_num = None
-
-        # --- Publishers (Telemetry)---
         self.gps_pub = self.create_publisher(NavSatFix, '/frontseat/gps', 10)
         self.heading_pub = self.create_publisher(Float64, '/frontseat/heading', 10)
         self.battery_pub = self.create_publisher(BatteryState, '/frontseat/battery', 10)
         self.temp_pub = self.create_publisher(Temperature, '/frontseat/temperature', 10)
         self.speed_pub = self.create_publisher(Float64, '/frontseat/speed', 10)
         self.yaw_rate_pub = self.create_publisher(Float64, '/frontseat/yaw_rate', 10)
-        # Current ArduPilot mode name published on every HEARTBEAT for subscribers.
         self.mode_pub = self.create_publisher(String, '/frontseat/mode', 10)
+        # servo1_raw..servo8_raw in microseconds.
+        self.thruster_pub = self.create_publisher(Int32MultiArray, '/frontseat/thruster_pwm', 10)
+        self.home_pub = self.create_publisher(NavSatFix, '/frontseat/home', LATCHED)
+        self.failsafe_pub = self.create_publisher(String, '/frontseat/failsafe', LATCHED)
+        self.time_pub = self.create_publisher(TimeReference, '/frontseat/time', 10)
+        self.params_pub = self.create_publisher(String, '/frontseat/params', LATCHED)
+        self.health = ModuleHealth(self, 'gateway')
+        self.health.event('mavlink_connected', source=_connected_ip, port=_port)
+        self.params = ParamCollector()
+        self.boat.mav.param_request_list_send(self.boat.target_system, self.boat.target_component)
+        self._reported_mode: str | None = None
+        self._last_lat: float | None = None
+        self._last_lon: float | None = None
+        self._last_alt_m = 0.0
+        self._home: tuple[float, float, float] | None = None
+        self._failsafe: dict[str, float] = {}
 
-        # --- Subscribers (Commands) ---
-        self.cmd_sub = self.create_subscription(
-            Command, '/system/brain/command', self.cmd_callback, 10)
+        # GLOBAL_POSITION_INT carries no fix quality, so track it from
+        # GPS_RAW_INT. None means none seen yet: report UNKNOWN, do not guess.
+        self._gps_fix_type: int | None = None
+        self._gps_had_fix = False
 
-        # Velocity subscriber — Brain publishes muxed Twist here in speed mode.
-        # We translate this to MAVLink body-frame velocity via
-        # SET_POSITION_TARGET_LOCAL_NED so the ArduRover PID handles execution.
-        self.vel_sub = self.create_subscription(
-            Twist, '/system/brain/cmd_vel', self.vel_callback, 10)
+        self.output_sub = self.create_subscription(
+            Setpoint, '/helm/output', self.output_callback, 10
+        )
+        self.set_home_sub = self.create_subscription(
+            NavSatFix, '/frontseat/set_home', self.set_home_callback, 10
+        )
 
-        # --- Timers ---
-        # 10Hz loop to read incoming telemetry from the flight controller
-        self.mavlink_timer = self.create_timer(0.1, self.read_mavlink)
-        # 1Hz loop to check if the Brain node is still alive
-        self.watchdog_timer = self.create_timer(1.0, self.watchdog_check)
+        # Steady clock: a wall-clock step would stall timers on the ROS clock.
+        steady = Clock(clock_type=ClockType.STEADY_TIME)
+        self.mavlink_timer = self.create_timer(0.1, self.read_mavlink, clock=steady)
+        self.watchdog_timer = self.create_timer(1.0, self.watchdog_check, clock=steady)
+        # Home and failsafe parameters change rarely (and QGroundControl can
+        # change them too), so poll them.
+        self.home_timer = self.create_timer(5.0, self._request_home_and_failsafe, clock=steady)
+        self._request_home_and_failsafe()
+        self.time_timer = self.create_timer(10.0, self._request_system_time, clock=steady)
+        self._request_system_time()
+        self.params_timer = self.create_timer(1.0, self._publish_params_when_done, clock=steady)
 
     # =========================================================================
     # MAVLINK -> ROS 2 (TELEMETRY)
     # =========================================================================
 
-    def read_mavlink(self):
+    def read_mavlink(self) -> None:
+        """Drain the MAVLink socket and republish what arrives onto ROS 2 topics."""
         # Drain all available messages per tick so fast-streaming message types
         # (ATTITUDE, VFR_HUD, etc.) never block GPS from reaching ROS.
         while True:
@@ -187,40 +167,42 @@ class GatewayNode(Node):
 
             msg_type = msg.get_type()
 
-            # 1. Track GPS fix quality (see _gps_fix_type above).
             if msg_type == 'GPS_RAW_INT':
-                self._gps_fix_type = int(msg.fix_type)
+                self._gps_fix_type = msg.fix_type
+                has_fix = msg.fix_type >= 2
+                if self._gps_had_fix and not has_fix:
+                    self.get_logger().error(
+                        f'GPS FIX LOST (fix_type={msg.fix_type}, '
+                        f'{msg.satellites_visible} sats). Position is no longer trustworthy.'
+                    )
+                    self.health.event('gps_fix_lost', level=ERROR, fix_type=msg.fix_type)
+                    self.health.error('no GPS fix')
+                elif has_fix and not self._gps_had_fix:
+                    self.health.event('gps_fix', fix_type=msg.fix_type)
+                    self.health.ok()
+                self._gps_had_fix = has_fix
 
-            # 2. Parse GPS and Heading
-            elif msg_type == 'GLOBAL_POSITION_INT':
+            if msg_type == 'GLOBAL_POSITION_INT':
+                # The stamp and status let the geofence tell a stale fix from a live one.
                 ros_gps = NavSatFix()
                 ros_gps.header.stamp = self.get_clock().now().to_msg()
                 ros_gps.header.frame_id = 'gps'
+                ros_gps.status.status = self._navsat_status()
+                ros_gps.status.service = NavSatStatus.SERVICE_GPS
                 ros_gps.latitude = msg.lat / 1e7
                 ros_gps.longitude = msg.lon / 1e7
-                ros_gps.altitude = msg.alt / 1000.0
-                # fix_type follows GPS_FIX_TYPE: 0 no GPS, 1 no fix, 2 2D,
-                # 3 3D, 4 DGPS, 5/6 RTK. Anything below 2D is not a position.
-                ros_gps.status.status = (
-                    NavSatStatus.STATUS_FIX if self._gps_fix_type >= 2
-                    else NavSatStatus.STATUS_NO_FIX)
-                ros_gps.status.service = NavSatStatus.SERVICE_GPS
                 self.gps_pub.publish(ros_gps)
+                self._last_lat, self._last_lon = ros_gps.latitude, ros_gps.longitude
+                self._last_alt_m = msg.alt / 1000.0
 
-                # Publish Heading (msg.hdg is in centidegrees, up to 35999. 65535 means invalid/unknown)
+                # hdg is centidegrees; 65535 means unknown.
                 if msg.hdg != 65535:
                     ros_heading = Float64()
                     ros_heading.data = msg.hdg / 100.0
                     self.heading_pub.publish(ros_heading)
 
-            # 3. Track frontseat arming state and mode from HEARTBEAT.
-            #
-            # When the gateway connects via a MAVProxy relay (e.g. remote SITL
-            # in SIM_PI_YOLO mode), MAVProxy also forwards its own GCS-type
-            # HEARTBEAT alongside the vehicle's.  GCS HEARTBEATs carry
-            # custom_mode = 0, which maps to MANUAL in ArduRover and would
-            # spuriously revoke the autonomy lease.  Skip any HEARTBEAT whose
-            # MAV_TYPE is GCS so only vehicle telemetry updates state.
+            # Only the locked autopilot updates the mode. GCS heartbeats, e.g.
+            # from a MAVProxy relay, carry custom_mode 0, which reads as MANUAL.
             elif msg_type == 'HEARTBEAT':
                 if msg.type == mavutil.mavlink.MAV_TYPE_GCS:
                     continue
@@ -228,213 +210,318 @@ class GatewayNode(Node):
                     continue
                 if msg.get_srcComponent() != self.boat.target_component:
                     continue
-                self._actual_armed = bool(
-                    msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
                 self._actual_mode_num = int(msg.custom_mode)
 
-                # Publish current ArduPilot mode so brain and other nodes can read it.
-                mode_name = _ROVER_MODE_NAME_BY_NUM.get(
-                    self._actual_mode_num, str(self._actual_mode_num))
+                mode_name = ROVER_MODE_NAME_BY_NUM.get(
+                    self._actual_mode_num, str(self._actual_mode_num)
+                )
                 mode_msg = String()
                 mode_msg.data = mode_name
                 self.mode_pub.publish(mode_msg)
+                if mode_name != self._reported_mode:
+                    self.health.event('autopilot_mode', mode=mode_name)
+                    self._reported_mode = mode_name
 
-            # 4. Parse Battery State
             elif msg_type == 'SYS_STATUS':
                 ros_batt = BatteryState()
                 ros_batt.voltage = msg.voltage_battery / 1000.0
 
-                # Current is in 10mA increments (-1 means no sensor)
-                if msg.current_battery != -1:
-                    ros_batt.current = msg.current_battery / 100.0
+                # Current is in 10mA increments (-1 means no sensor). BatteryState
+                # marks an unmeasured value as NaN; its 0.0 default would read as
+                # "no current" or "battery empty".
+                ros_batt.current = (
+                    msg.current_battery / 100.0 if msg.current_battery != -1 else math.nan
+                )
 
                 # Remaining is percentage (-1 means no sensor)
-                if msg.battery_remaining != -1:
-                    ros_batt.percentage = msg.battery_remaining / 100.0
+                ros_batt.percentage = (
+                    msg.battery_remaining / 100.0 if msg.battery_remaining != -1 else math.nan
+                )
 
                 self.battery_pub.publish(ros_batt)
 
-            # 5. Parse Temperature
+            elif msg_type == 'HOME_POSITION':
+                home = (msg.latitude / 1e7, msg.longitude / 1e7, msg.altitude / 1000.0)
+                if home != self._home:
+                    self.get_logger().info(
+                        f'Autopilot home: {home[0]:.7f}, {home[1]:.7f} ({home[2]:.1f} m AMSL)'
+                    )
+                self._home = home
+                ros_home = NavSatFix()
+                ros_home.header.stamp = self.get_clock().now().to_msg()
+                ros_home.header.frame_id = 'home'
+                ros_home.latitude, ros_home.longitude, ros_home.altitude = home
+                self.home_pub.publish(ros_home)
+
+            elif msg_type == 'SYSTEM_TIME':
+                # Zero until the autopilot has GPS time.
+                if msg.time_unix_usec > 0:
+                    ref = TimeReference()
+                    ref.header.stamp = self.get_clock().now().to_msg()
+                    ref.time_ref.sec = int(msg.time_unix_usec // 1_000_000)
+                    ref.time_ref.nanosec = int(msg.time_unix_usec % 1_000_000) * 1000
+                    ref.source = 'autopilot'
+                    self.time_pub.publish(ref)
+
+            elif msg_type == 'PARAM_VALUE':
+                name = msg.param_id.rstrip('\x00') if isinstance(msg.param_id, str) else ''
+                self.params.add(name, float(msg.param_value), msg.param_count, time.monotonic())
+                if name in FAILSAFE_PARAMS:
+                    self._failsafe[name] = float(msg.param_value)
+                    fs = String()
+                    fs.data = json.dumps(self._failsafe)
+                    self.failsafe_pub.publish(fs)
+
+            elif msg_type == 'COMMAND_ACK':
+                if msg.command == mavutil.mavlink.MAV_CMD_DO_SET_HOME:
+                    accepted = msg.result == mavutil.mavlink.MAV_RESULT_ACCEPTED
+                    (self.get_logger().info if accepted else self.get_logger().error)(
+                        f'Set home {"accepted" if accepted else f"refused (result {msg.result})"}'
+                    )
+                    self._request_home_and_failsafe()
+
             elif msg_type == 'SCALED_PRESSURE':
                 ros_temp = Temperature()
                 ros_temp.header.stamp = self.get_clock().now().to_msg()
                 ros_temp.temperature = msg.temperature / 100.0  # MAVLink sends centidegrees
                 self.temp_pub.publish(ros_temp)
 
-            # 6. Parse groundspeed (m/s, scalar magnitude)
+            # Groundspeed, m/s.
             elif msg_type == 'VFR_HUD':
                 ros_speed = Float64()
                 ros_speed.data = float(msg.groundspeed)
                 self.speed_pub.publish(ros_speed)
 
-            # 7. Parse body yaw rate (rad/s, IMU-derived)
+            # Body yaw rate, rad/s.
             elif msg_type == 'ATTITUDE':
                 ros_yaw_rate = Float64()
                 ros_yaw_rate.data = float(msg.yawspeed)
                 self.yaw_rate_pub.publish(ros_yaw_rate)
 
+            elif msg_type == 'SERVO_OUTPUT_RAW':
+                ros_thrusters = Int32MultiArray()
+                ros_thrusters.data = [
+                    msg.servo1_raw,
+                    msg.servo2_raw,
+                    msg.servo3_raw,
+                    msg.servo4_raw,
+                    msg.servo5_raw,
+                    msg.servo6_raw,
+                    msg.servo7_raw,
+                    msg.servo8_raw,
+                ]
+                self.thruster_pub.publish(ros_thrusters)
+
     # =========================================================================
     # ROS 2 -> MAVLINK (COMMAND TRANSLATION)
     # =========================================================================
 
-    def cmd_callback(self, msg):
-        # 1. Security Check
-        if msg.source_node != "core_autonomy":
-            self.get_logger().warn(f"SECURITY REJECT: Unauthorized node '{msg.source_node}' tried to command the boat!")
+    def output_callback(self, msg: Setpoint) -> None:
+        """Forward the helm's command, but only from the helm and only in GUIDED."""
+        now = time.monotonic()
+        was_active = self.lease.active
+        if not self.lease.on_command(msg.source, now, self._actual_mode_num):
+            self.get_logger().warn(
+                f"SECURITY REJECT: Unauthorized node '{msg.source}' tried to command the boat!",
+                throttle_duration_sec=5.0,
+            )
             return
+        if self.lease.active and not was_active:
+            self.get_logger().info('Autonomy Lease Acquired. State: ACTIVE')
+            self.health.event('lease_acquired')
 
-        # 2. Lease Renewal — brain keepalive; lease only counts while in GUIDED
-        # (operator has authorized autonomous operation).
-        self.last_heartbeat_time = time.time()
-        if not self.autonomy_active and self._actual_mode_num == _ROVER_MODE['GUIDED']:
-            self.get_logger().info("Autonomy Lease Acquired. State: ACTIVE")
-            self.autonomy_active = True
+        if msg.mode == Setpoint.MODE_KEEPALIVE:
+            return
+        # ArduRover auto-enters GUIDED on SET_POSITION_TARGET, so send only when in it.
+        if not self.lease.allows_send(now, self._actual_mode_num):
+            return
+        if msg.mode in (Setpoint.MODE_POSITION, Setpoint.MODE_HOLD):
+            self._send_position(msg.latitude, msg.longitude)
+        elif msg.mode == Setpoint.MODE_VELOCITY:
+            self._send_velocity(msg.speed_mps, msg.yaw_rate_rps)
 
-        # 3. Arming follows the brain's own enable flag, carried in the
-        # heartbeat's string_param. Arming merely on lease acquisition would
-        # spin up a vehicle whose operator selected GUIDED intending to drive
-        # it themselves. Requiring the brain to be actively relaying means
-        # nothing moves until someone asks for it twice: once by selecting
-        # GUIDED, once by enabling autonomy.
-        #
-        # The watchdog retries until ArduPilot's prearm checks pass. Set the
-        # auto_arm parameter false to keep arming strictly operator-driven.
-        #
-        # CMD_MODE itself commands nothing: ArduPilot's flight mode is written
-        # exclusively by the operator via RC or a ground station. The message
-        # exists to prove the brain is alive and to report what it intends.
-        if msg.command_type == Command.CMD_MODE:
-            self._desired_armed = (msg.string_param == 'ENABLED')
+    def _send_position(self, lat: float, lon: float) -> None:
+        self.boat.mav.set_position_target_global_int_send(
+            0,
+            self.boat.target_system,
+            self.boat.target_component,
+            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+            3576,
+            int(lat * 1e7),
+            int(lon * 1e7),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
 
-        # 4. MAVLink translation
-        elif msg.command_type == Command.CMD_WAYPOINT:
-            # Only forward waypoints when the frontseat is actually in GUIDED;
-            # ArduRover can auto-enter GUIDED on receiving SET_POSITION_TARGET,
-            # which would override the operator in unexpected ways.
-            if self._actual_mode_num != _ROVER_MODE['GUIDED']:
-                return
-            lat_int = int(msg.float_params[0] * 1e7)
-            lon_int = int(msg.float_params[1] * 1e7)
+    def _send_velocity(self, speed_mps: float, yaw_rate_rps: float) -> None:
+        """Send a body-frame velocity target.
 
-            self.boat.mav.set_position_target_global_int_send(
-                0, self.boat.target_system, self.boat.target_component,
-                mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-                3576, lat_int, lon_int, 0,
-                0, 0, 0, 0, 0, 0, 0, 0)
-
-    # =========================================================================
-    # TWIST -> MAVLINK (VELOCITY CONTROL)
-    # =========================================================================
-
-    def vel_callback(self, msg: Twist):
-        """Translate a Twist from the Brain's velocity mux into a MAVLink
-        body-frame velocity command.
-
-        Uses SET_POSITION_TARGET_LOCAL_NED with:
-          - type_mask = 0b0000_11_0_111_000_111 (= 0x0DC7)
-            Bits set → ignore position (xyz), acceleration (ax/ay/az),
-            and yaw angle.  Bits clear → use vx, vy, vz, yaw_rate.
-          - coordinate_frame = MAV_FRAME_BODY_NED so vx is forward
-            along the hull, not geographic north.
-          - vx = msg.linear.x  (m/s forward)
-          - vy = 0             (no lateral thrust on skid-steer)
-          - vz = 0             (surface vessel)
-          - yaw_rate = msg.angular.z  (rad/s)
-
-        The ArduRover firmware's internal PID loops handle the actual
-        thruster mixing to achieve the requested velocity and yaw rate.
+        vy and vz are 0 on a skid-steer surface vessel. ArduRover's controllers do the
+        thruster mixing.
         """
-        if not self.autonomy_active:
-            # Don't send velocity if no valid heartbeat lease
-            return
-
-        if self._actual_mode_num != _ROVER_MODE['GUIDED']:
-            # ArduRover can auto-enter GUIDED on receiving SET_POSITION_TARGET,
-            # overriding the operator. Only send velocity when already in GUIDED.
-            return
-
-        # Type mask: use vx, vy, vz, yaw_rate — ignore everything else
-        # Bit layout (LSB → MSB):
-        #   0-2: ignore pos x,y,z  = 0b111 = 7
-        #   3-5: USE vel x,y,z     = 0b000 = 0
-        #   6-8: ignore accel      = 0b111 = 7 → shifted = 0x01C0
-        #   9:   ignore force       = 0b0
-        #  10:   ignore yaw         = 0b1   → shifted = 0x0400
-        #  11:   USE yaw_rate       = 0b0
-        # Result = 0b0000_10_0_111_000_111 = 0x04C7
+        # Ignores position (bits 0-2), ax/ay (6-7) and yaw (10); uses velocity and
+        # yaw_rate. Bit 8 (az) is clear.
         type_mask = 0x04C7
 
         self.boat.mav.set_position_target_local_ned_send(
-            0,                                             # time_boot_ms (0 = auto)
+            0,  # time_boot_ms (0 = auto)
             self.boat.target_system,
             self.boat.target_component,
-            mavutil.mavlink.MAV_FRAME_BODY_NED,            # body-frame: vx = forward
+            mavutil.mavlink.MAV_FRAME_BODY_NED,  # body-frame: vx = forward
             type_mask,
-            0, 0, 0,                                       # x, y, z (ignored)
-            float(msg.linear.x), 0.0, 0.0,                 # vx, vy, vz (m/s)
-            0, 0, 0,                                       # afx, afy, afz (ignored)
-            0,                                              # yaw (ignored)
-            float(msg.angular.z),                           # yaw_rate (rad/s)
+            0,
+            0,
+            0,  # x, y, z (ignored)
+            float(speed_mps),
+            0.0,
+            0.0,  # vx, vy, vz (m/s)
+            0,
+            0,
+            0,  # afx, afy, afz (ignored)
+            0,  # yaw (ignored)
+            float(yaw_rate_rps),  # yaw_rate (rad/s)
         )
 
     # =========================================================================
-    # HARDWARE WATCHDOG & FAILSAFE
+    # WATCHDOG & FAILSAFE
     # =========================================================================
 
-    def watchdog_check(self):
-        # 1) Brain heartbeat failsafe. If the brain dies while holding an
-        # autonomy lease, revoke the lease and stop forwarding commands.
-        # ArduPilot mode is NOT changed — the operator must take over via RC.
-        if self.autonomy_active and (time.time() - self.last_heartbeat_time > 2.0):
+    def set_home_callback(self, msg: NavSatFix) -> None:
+        """Set the autopilot's home (MAV_CMD_DO_SET_HOME), where RTL and the link-loss failsafe go.
+
+        Not a motion command: it is accepted in any mode and without the lease.
+        NaN altitude means the vessel's current altitude.
+        """
+        lat, lon = float(msg.latitude), float(msg.longitude)
+        if not (math.isfinite(lat) and math.isfinite(lon)) or abs(lat) > 90 or abs(lon) > 180:
+            self.get_logger().warn(f'Refusing set_home to ({lat}, {lon}): not a position.')
+            return
+        if self._last_lat is not None:
+            d = haversine_m(lat, lon, self._last_lat, self._last_lon)
+            if d > MAX_HOME_DISTANCE_M:
+                self.get_logger().warn(
+                    f'Refusing set_home {d:.0f} m from the vessel '
+                    f'(limit {MAX_HOME_DISTANCE_M:.0f} m).'
+                )
+                return
+        alt = float(msg.altitude) if math.isfinite(msg.altitude) else self._last_alt_m
+        self.boat.mav.command_int_send(
+            self.boat.target_system,
+            self.boat.target_component,
+            mavutil.mavlink.MAV_FRAME_GLOBAL,
+            mavutil.mavlink.MAV_CMD_DO_SET_HOME,
+            0,
+            0,
+            0.0,  # param1 0: use the given location, not the current one
+            0.0,
+            0.0,
+            0.0,
+            round(lat * 1e7),
+            round(lon * 1e7),
+            alt,
+        )
+        self.get_logger().info(f'Set home requested: {lat:.7f}, {lon:.7f}')
+
+    def _request_system_time(self) -> None:
+        self.boat.mav.command_long_send(
+            self.boat.target_system,
+            self.boat.target_component,
+            mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+            0,
+            mavutil.mavlink.MAVLINK_MSG_ID_SYSTEM_TIME,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+
+    def _publish_params_when_done(self) -> None:
+        if not self.params.ready(time.monotonic()):
+            return
+        msg = String()
+        msg.data = json.dumps(self.params.snapshot())
+        self.params_pub.publish(msg)
+        self.params.published = True
+        self.params_timer.cancel()
+        self.health.event(
+            'autopilot_params',
+            level=WARN if self.params.missing else OK,
+            count=len(self.params.values),
+            missing=self.params.missing,
+        )
+
+    def _request_home_and_failsafe(self) -> None:
+        self.boat.mav.command_long_send(
+            self.boat.target_system,
+            self.boat.target_component,
+            mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+            0,
+            mavutil.mavlink.MAVLINK_MSG_ID_HOME_POSITION,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+        for name in FAILSAFE_PARAMS:
+            self.boat.mav.param_request_read_send(
+                self.boat.target_system, self.boat.target_component, name.encode('ascii'), -1
+            )
+
+    def watchdog_check(self) -> None:
+        """Revoke the autonomy lease when the helm stops sending keepalives."""
+        # The mode is left alone; the operator takes over by RC.
+        if not self.lease.tick(time.monotonic()):
             self.get_logger().error(
-                "FAILSAFE: Brain Heartbeat Lost! Autonomy lease revoked. "
-                "No further waypoint/velocity commands will be forwarded. "
-                "Take manual control via RC transmitter.")
-            self.autonomy_active = False
-            # Stop *requesting* arming. This does not disarm: the vehicle stays
-            # armed so ArduPilot can keep holding station against wind and
-            # current. Disarming here would leave the boat drifting freely with
-            # no autonomy running and no operator expecting it to move.
-            self._desired_armed = False
-            return
+                'FAILSAFE: helm keepalive lost. Autonomy lease revoked. '
+                'No further commands will be forwarded. '
+                'Take manual control via RC transmitter.'
+            )
+            self.health.event('lease_revoked', level=ERROR)
+            self.health.warn('lease revoked')
 
-        # 2) Arming reconciliation. If the Brain is driving and wants us
-        # armed, keep retrying until ArduPilot's prearm checks agree. A
-        # fresh SITL usually passes prearm within a few seconds of EKF
-        # convergence, but on a real boat this can take longer — so we
-        # just keep asking at 1 Hz until the HEARTBEAT base_mode shows
-        # MAV_MODE_FLAG_SAFETY_ARMED. If prearm is failing, the operator
-        # will see the reason in the SITL/MAVProxy console or the
-        # STATUSTEXT stream; we do not surface those here to avoid
-        # double-logging.
-        if not self.get_parameter('auto_arm').value:
-            return
-        if self._desired_armed and not self._actual_armed:
-            self._arm_confirmed_logged = False
-            now = time.time()
-            if (now - self._last_arm_attempt_t) >= 1.0:
-                self._send_arm_disarm(True)
-                self._last_arm_attempt_t = now
-                self.get_logger().info(
-                    "Arm requested — retrying until ArduPilot prearm checks pass.")
-        elif self._desired_armed and self._actual_armed and not self._arm_confirmed_logged:
-            self.get_logger().info("ArduPilot armed — autonomy ready.")
-            self._arm_confirmed_logged = True
+    def _navsat_status(self) -> int:
+        """Map the autopilot's GPS fix type onto a NavSatStatus constant.
 
-    def _request_required_streams(self, rate_hz: int = 5):
+        ArduPilot fix_type: 0-1 no fix, 2 2D, 3 3D, 4 DGPS, 5 RTK float, 6 RTK fixed.
+        """
+        fix_type = self._gps_fix_type
+        if fix_type is None:
+            return NavSatStatus.STATUS_UNKNOWN
+        if fix_type >= 5:
+            return NavSatStatus.STATUS_GBAS_FIX
+        if fix_type == 4:
+            return NavSatStatus.STATUS_SBAS_FIX
+        if fix_type >= 2:
+            return NavSatStatus.STATUS_FIX
+        return NavSatStatus.STATUS_NO_FIX
+
+    def _request_required_streams(self, rate_hz: int = 5) -> None:
         """Ask ArduPilot for the telemetry streams required by the stack.
 
         Requests:
-          - MAV_DATA_STREAM_POSITION        (GLOBAL_POSITION_INT, etc.)
-          - MAV_DATA_STREAM_EXTRA1          (VFR_HUD, etc.)
-          - MAV_DATA_STREAM_EXTRA2          (ATTITUDE, etc.)
-          - MAV_DATA_STREAM_EXTENDED_STATUS (GPS_RAW_INT, etc.)
+          - MAV_DATA_STREAM_POSITION      (GLOBAL_POSITION_INT, etc.)
+          - MAV_DATA_STREAM_EXTENDED_STATUS (GPS_RAW_INT, for fix quality)
+          - MAV_DATA_STREAM_EXTRA1        (VFR_HUD, etc.)
+          - MAV_DATA_STREAM_EXTRA2        (ATTITUDE, etc.)
+          - MAV_DATA_STREAM_RAW_CONTROLLER (SERVO_OUTPUT_RAW, thruster PWM)
         """
         streams = [
             (mavutil.mavlink.MAV_DATA_STREAM_POSITION, 'POSITION'),
+            (mavutil.mavlink.MAV_DATA_STREAM_EXTENDED_STATUS, 'EXTENDED_STATUS'),
             (mavutil.mavlink.MAV_DATA_STREAM_EXTRA1, 'EXTRA1'),
             (mavutil.mavlink.MAV_DATA_STREAM_EXTRA2, 'EXTRA2'),
-            (mavutil.mavlink.MAV_DATA_STREAM_EXTENDED_STATUS, 'EXTENDED_STATUS'),
+            (mavutil.mavlink.MAV_DATA_STREAM_RAW_CONTROLLER, 'RAW_CONTROLLER'),
         ]
         for stream_id, stream_name in streams:
             self.boat.mav.request_data_stream_send(
@@ -445,23 +532,22 @@ class GatewayNode(Node):
                 1,  # 1 = start streaming
             )
             self.get_logger().info(
-                f'Requested MAV_DATA_STREAM_{stream_name} at {rate_hz} Hz from frontseat.')
+                f'Requested MAV_DATA_STREAM_{stream_name} at {rate_hz} Hz from frontseat.'
+            )
 
-    def _send_arm_disarm(self, arm: bool) -> None:
-        """Fire a MAV_CMD_COMPONENT_ARM_DISARM (idempotent on ArduRover)."""
-        self.boat.mav.command_long_send(
-            self.boat.target_system,
-            self.boat.target_component,
-            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-            0,
-            1.0 if arm else 0.0,
-            0, 0, 0, 0, 0, 0,
-        )
 
-def main(args=None):
+def main(args: list[str] | None = None) -> None:
+    """Spin the gateway node until shutdown."""
     rclpy.init(args=args)
-    rclpy.spin(GatewayNode())
-    rclpy.shutdown()
+    node = GatewayNode()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
 
 if __name__ == '__main__':
     main()

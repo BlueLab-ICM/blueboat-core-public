@@ -1,0 +1,22 @@
+---
+title: "Executive"
+description: "Run plans as behaviour trees."
+---
+
+The executive owns the run lifecycle: idle, ready, starting, running, paused, returning, and the finished states. Inside a run it ticks a behaviour tree at 10 Hz. Requests arrive on `/executive/request`, status goes out on `/executive/status`.
+
+## Applications
+
+An application plugs in through `BLUEBOAT_APPLICATION`, `package.module:Class`, and subclasses `core_executive.application.Application`. It supplies the plan schema, the tree, and optional pre-flight checks, extra requests and status fields. With none set the executive runs the built-in survey: waypoints, then optionally one skill.
+
+## Behaviours
+
+`core_executive.behaviours` holds what any mission can use: `NavigateTo`, `HoldFor`, `StartTrial`, `EndTrial` and `RunSkill`. They act only through `World`, so a tree runs the same on the vehicle and in a unit test.
+
+## Skills
+
+A skill is a module serving `core_interfaces/RunSkill` on `/skills/<name>`. Parameters and results are JSON, documented in the module, so a tree can run any skill without importing its types. `RunSkill` grants the helm to the skill for as long as the goal runs, and cancels the goal however the behaviour ends.
+
+## Reactive priority
+
+A `Selector` with `memory=False` rechecks its first child on every tick. Use it for anything that must preempt the mission. A `Sequence` with `memory=True` resumes at the running child, which suits a mission script.

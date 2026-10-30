@@ -41,8 +41,8 @@ This page assumes the [hardware is installed](/hardware/overview) and you have r
 
   <Step title="Clone and build">
     ```bash
-    git clone https://github.com/BlueLab-ICM/blueboat-core-public.git
-    cd blueboat-core-public
+    git clone https://github.com/BlueLab-ICM/blueboat-core.git
+    cd blueboat-core
     docker compose -f deployment/docker-compose.yml build
     ```
   </Step>
@@ -97,7 +97,7 @@ Do these at the dock, with WiFi. `docker build` needs the network, and BuildKit 
   <Step title="Start the stack">
     ```bash
     ssh backseat@192.168.2.10
-    cd blueboat-core-public
+    cd blueboat-core
     docker compose -f deployment/docker-compose.yml --profile record up -d
     ```
 
@@ -111,7 +111,7 @@ Do these at the dock, with WiFi. `docker build` needs the network, and BuildKit 
 
   <Step title="Configure the mission">
     ```bash
-    docker exec core_autonomy bash -c "source /opt/ros/jazzy/setup.bash && \
+    docker exec core_executive bash -c "source /opt/ros/jazzy/setup.bash && \
       ros2 param set --no-daemon /brain_node waypoint_file deployment/waypoints/site_a.json && \
       ros2 param set --no-daemon /brain_node geofence_radius_m 90.0"
     ```
@@ -127,7 +127,7 @@ Do these at the dock, with WiFi. `docker build` needs the network, and BuildKit 
 
   <Step title="Enable autonomy">
     ```bash
-    docker exec core_autonomy bash -c "source /opt/ros/jazzy/setup.bash && \
+    docker exec core_executive bash -c "source /opt/ros/jazzy/setup.bash && \
       ros2 service call /system/enable_autonomy std_srvs/srv/SetBool '{data: true}'"
     ```
 
@@ -156,7 +156,7 @@ Do these at the dock, with WiFi. `docker build` needs the network, and BuildKit 
 <CardGroup cols={2}>
   <Card title="The brain" icon="terminal">
     ```bash
-    docker logs -f core_autonomy
+    docker logs -f core_executive
     ```
     Status transitions and waypoint progress. Quiet is healthy — the log is edge-triggered.
   </Card>

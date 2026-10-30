@@ -26,8 +26,8 @@ Linux and macOS both work. On Windows, use WSL 2.
 ## Start the simulation
 
 ```bash
-git clone https://github.com/BlueLab-ICM/blueboat-core-public.git
-cd blueboat-core-public
+git clone https://github.com/BlueLab-ICM/blueboat-core.git
+cd blueboat-core
 
 docker compose -f deployment/docker-compose.yml \
                -f deployment/docker-compose.sitl.yml up -d --build
@@ -39,7 +39,7 @@ Four containers come up:
 |-----------|------|
 | `core_sitl` | ArduPilot SITL — the simulated frontseat |
 | `core_gateway` | MAVLink bridge and watchdog |
-| `core_autonomy` | Brain, diagnostics and telemetry logging |
+| `core_executive` | Brain, diagnostics and telemetry logging |
 | `core_foxglove` | WebSocket bridge for live visualisation |
 
 Confirm the gateway found the autopilot:
@@ -88,7 +88,7 @@ Note the port: **5762**, not the usual 5760. SITL's `serial0` is redirected to t
 Two things: point the brain at a waypoint file, then enable relaying.
 
 ```bash
-docker exec core_autonomy bash -c "source /opt/ros/jazzy/setup.bash && \
+docker exec core_executive bash -c "source /opt/ros/jazzy/setup.bash && \
   ros2 param set --no-daemon /brain_node waypoint_file \
       deployment/waypoints/lawnmower_survey.json && \
   ros2 service call /system/enable_autonomy std_srvs/srv/SetBool '{data: true}'"
@@ -103,7 +103,7 @@ std_srvs.srv.SetBool_Response(success=True, message='Autonomy relaying enabled.'
 The boat is now flying a 12-point lawnmower survey autonomously:
 
 ```bash
-docker logs -f core_autonomy
+docker logs -f core_executive
 ```
 
 ```
@@ -137,7 +137,7 @@ The geofence centres itself on the first valid GPS fix, so the boat is always fe
 
   <Tab title="Raw telemetry">
     ```bash
-    docker exec -it core_autonomy bash
+    docker exec -it core_executive bash
     source /opt/ros/jazzy/setup.bash
 
     ros2 topic echo /frontseat/gps
@@ -174,7 +174,7 @@ Simulation is the only place where it is sensible to break things deliberately.
 
   <Accordion title="Kill the autonomy" icon="skull">
     ```bash
-    docker stop core_autonomy
+    docker stop core_executive
     ```
 
     Within two seconds the gateway logs:
@@ -190,7 +190,7 @@ Simulation is the only place where it is sensible to break things deliberately.
 
   <Accordion title="Ask for a mission that does not fit" icon="circle-dot">
     ```bash
-    docker exec core_autonomy bash -c "source /opt/ros/jazzy/setup.bash && \
+    docker exec core_executive bash -c "source /opt/ros/jazzy/setup.bash && \
       ros2 param set --no-daemon /brain_node geofence_radius_m 20.0 && \
       ros2 service call /system/enable_autonomy std_srvs/srv/SetBool '{data: true}'"
     ```

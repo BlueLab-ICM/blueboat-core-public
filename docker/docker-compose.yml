@@ -1,0 +1,157 @@
+# The core of the vehicle. Applications and modules are added on top by start-mission.sh.
+x-logging: &logging
+  # journald keeps a mission's logs through a compose down and a power cut.
+  driver: ${DOCKER_LOG_DRIVER:-journald}
+  options:
+    tag: "{{.Name}}"
+    env: MISSION_ID
+
+# One image. Only the helm service builds it: parallel builds of one image can fail.
+x-core-service: &core-service
+  image: blueboat-core
+  network_mode: "host"
+  ipc: "host"
+  restart: no
+  logging: *logging
+
+services:
+  gateway:
+    image: blueboat-gateway
+    build:
+      context: ../
+      dockerfile: docker/Dockerfile.gateway
+    container_name: core_gateway
+    network_mode: "host"
+    ipc: "host"
+    restart: no
+    logging: *logging
+    environment:
+      # Set to the SITL/laptop IP when running in sim mode to prevent the
+      # gateway from accidentally connecting to the real Navigator via BlueOS.
+      #   GATEWAY_EXPECTED_SOURCE=<laptop-ip>
+      - GATEWAY_EXPECTED_SOURCE=${GATEWAY_EXPECTED_SOURCE:-}
+      # Set to 14552 in sim mode so the real frontseat Pi (which broadcasts
+      # to 14550) can never reach this gateway.
+      - MAVLINK_PORT=${MAVLINK_PORT:-14550}
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:?source config/vehicle.env first}
+      - MISSION_ID=${MISSION_ID:-}
+
+  helm:
+    <<: *core-service
+    build:
+      context: ../
+      dockerfile: docker/Dockerfile.core
+    container_name: core_helm
+    depends_on:
+      - gateway
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:?source config/vehicle.env first}
+      - MISSION_ID=${MISSION_ID:-}
+    volumes:
+      - ../config/helm.yaml:/config/helm.yaml:ro
+    command:
+      - /bin/bash
+      - -c
+      - >-
+        source install/setup.bash &&
+        exec ros2 run core_helm helm_node --ros-args --params-file /config/helm.yaml
+
+  fleet:
+    <<: *core-service
+    container_name: core_fleet
+    environment:
+      - VEHICLE_NAME=${VEHICLE_NAME:-}
+      - FLEET_PEERS=${FLEET_PEERS:-}
+      - FLEET_PORT=${FLEET_PORT:-}
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:?source config/vehicle.env first}
+      - MISSION_ID=${MISSION_ID:-}
+    command:
+      - /bin/bash
+      - -c
+      - source install/setup.bash && exec ros2 run core_helm fleet_node
+
+  executive:
+    <<: *core-service
+    container_name: core_executive
+    depends_on:
+      - helm
+    environment:
+      - VEHICLE_NAME=${VEHICLE_NAME:-}
+      - BACKSEAT_PLATFORM=${BACKSEAT_PLATFORM:-}
+      - BLUEBOAT_APPLICATION=${BLUEBOAT_APPLICATION:-}
+      - SIM_MODE=${SIM_MODE:-false}
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:?source config/vehicle.env first}
+      - MISSION_ID=${MISSION_ID:-}
+    volumes:
+      - ../experiments:/experiments:ro
+    command:
+      - /bin/bash
+      - -c
+      - source install/setup.bash && exec ros2 run core_executive executive_node
+
+  ops:
+    <<: *core-service
+    container_name: core_ops
+    environment:
+      - VEHICLE_NAME=${VEHICLE_NAME:-}
+      - BACKSEAT_PLATFORM=${BACKSEAT_PLATFORM:-}
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:?source config/vehicle.env first}
+      - MISSION_ID=${MISSION_ID:-}
+    volumes:
+      # Container stats only. No command path runs in this container.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /sys/class/thermal:/sys/class/thermal:ro
+    command:
+      - /bin/bash
+      - -c
+      - source install/setup.bash && exec ros2 launch core_ops ops.launch.py
+
+  logger:
+    <<: *core-service
+    container_name: core_logger
+    profiles: [ "record" ]
+    # Lets rosbag2 close the last file, so its metadata reaches the disk.
+    stop_signal: SIGINT
+    stop_grace_period: 30s
+    depends_on:
+      - ops
+    environment:
+      - BAG_FORMAT=${BAG_FORMAT:-mcap}
+      - BAG_EXCLUDE_REGEX=${BAG_EXCLUDE_REGEX:-}
+      - BAG_SPLIT_S=${BAG_SPLIT_S:-300}
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:?source config/vehicle.env first}
+      - MISSION_ID=${MISSION_ID:-}
+    volumes:
+      - ./record-bag.sh:/record-bag.sh:ro
+    command: [ "/bin/bash", "/record-bag.sh" ]
+
+  foxglove_bridge:
+    build:
+      context: ../
+      dockerfile: docker/Dockerfile.foxglove
+    container_name: core_foxglove
+    network_mode: "host"
+    ipc: "host"
+    restart: no
+    logging: *logging
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:?source config/vehicle.env first}
+      - MISSION_ID=${MISSION_ID:-}
+
+  # Bridges ROS 2 topics onto Zenoh so the bluelab-dashboard backend can subscribe over the network.
+  zenoh_bridge:
+    # Same release as the dashboard backend's zenoh crate.
+    image: eclipse/zenoh-bridge-ros2dds:1.9.0
+    container_name: core_zenoh_bridge
+    network_mode: "host"
+    ipc: "host"
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      - ROS_DISTRO=jazzy
+      - RUST_LOG=warn
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:?source config/vehicle.env first}
+      - MISSION_ID=${MISSION_ID:-}
+    volumes:
+      - ./zenoh-bridge-outbound.json5:/zenoh-bridge.json5:ro
+    command: [ "-c", "/zenoh-bridge.json5" ]

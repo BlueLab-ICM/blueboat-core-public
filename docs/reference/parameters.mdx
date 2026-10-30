@@ -6,7 +6,7 @@ description: "Every ROS 2 parameter and environment variable, with defaults"
 Parameters are ordinary ROS 2 parameters — set them with `ros2 param set`, or load a block from a YAML file with `ros2 param load` if you keep per-site settings in version control.
 
 ```bash
-docker exec -it core_autonomy bash
+docker exec -it core_executive bash
 source /opt/ros/jazzy/setup.bash
 ros2 param list /brain_node
 ros2 param set --no-daemon /brain_node geofence_radius_m 80.0
@@ -112,7 +112,7 @@ Set these in `deployment/.env` or the shell.
 |----------|---------|-------------|
 | `DATA_DIR` | `../data` | Root of rosbag and telemetry output. Point it outside the repository |
 | `BAG_FORMAT` | `mcap` | `mcap` or `sqlite3` |
-| `BAG_EXCLUDE_REGEX` | unset | Anchored alternation regex of topics to skip, e.g. `^/payload/camera/image_raw$` |
+| `BAG_EXCLUDE_REGEX` | unset | Anchored alternation regex of topics to skip, e.g. `^/sensors/camera/image_raw$` |
 | `SITL_HOME` | `41.362628,2.186193,0,0` | Simulated start position: `lat,lon,alt,heading` |
 
 Compose profiles:

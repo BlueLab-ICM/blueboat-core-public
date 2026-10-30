@@ -1,0 +1,38 @@
+# Ruff replaces flake8, pep257 and isort.
+
+[tool.ruff]
+# Jetson host is 3.10, containers are 3.12. Target the lower bound.
+target-version = "py310"
+line-length = 100
+# Payloads are separate repos with their own config. build/, install/ and log/
+# are skipped already: ruff excludes build and honours .gitignore.
+extend-exclude = ["src/modules"]
+
+[tool.ruff.format]
+# House style
+quote-style = "single"
+
+[tool.ruff.lint]
+# BLE: a node that swallows every exception fails silently on the water.
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF", "ANN", "D", "BLE"]
+# The google convention drops the imperative-mood check; the lab style keeps it.
+extend-select = ["D401"]
+ignore = [
+  # Comments and docstrings use real typography (en dash, multiplication sign).
+  "RUF002",
+  "RUF003",
+  # An __init__ docstring restates the class docstring.
+  "D107",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# ament_python generates setup.py from a template with no module docstring.
+"*/setup.py" = ["D100"]
+# Operator CLIs report any failure and exit; a blind except is the right shape.
+"scripts/**" = ["BLE"]
+# Tests are named, not documented. Probes that accept any message type are typed
+# Any, and a validator reports every failure. Formatting rules still apply.
+"tests/**" = ["ANN401", "BLE", "D100", "D101", "D102", "D103", "D104"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"

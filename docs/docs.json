@@ -28,7 +28,8 @@
             "pages": [
               "architecture/overview",
               "architecture/gateway",
-              "architecture/brain",
+              "architecture/helm",
+              "architecture/executive",
               "architecture/safety",
               "architecture/topics"
             ]
@@ -45,8 +46,8 @@
           {
             "group": "Guides",
             "pages": [
-              "guides/waypoint-missions",
-              "guides/adding-a-payload",
+              "guides/surveys",
+              "guides/adding-a-module",
               "guides/monitoring",
               "guides/data-logging",
               "guides/troubleshooting"
@@ -73,7 +74,7 @@
     ],
     "primary": {
       "type": "github",
-      "href": "https://github.com/BlueLab-ICM/blueboat-core-public"
+      "href": "https://github.com/BlueLab-ICM/blueboat-core"
     }
   },
   "footer": {

@@ -52,7 +52,7 @@ Read it upward: the further up a protection sits, the less it depends on softwar
   <Accordion title="The source check" icon="user-shield">
     **Catches:** a payload commanding the vehicle, whether by mistake or by design.
 
-    ROS 2 topics are visible to every node. The gateway drops any `Command` whose `source_node` is not `core_autonomy`, and logs the rejection loudly enough to find in a bag afterwards.
+    ROS 2 topics are visible to every node. The gateway drops any `Command` whose `source_node` is not `core_executive`, and logs the rejection loudly enough to find in a bag afterwards.
 
     Isolation here is by policy rather than by DDS permissions, which keeps payload development simple. The check is what makes the policy real.
   </Accordion>
@@ -123,7 +123,7 @@ In simulation, break things on purpose:
 
   <Step title="Kill the brain">
     ```bash
-    docker stop core_autonomy
+    docker stop core_executive
     ```
     Within two seconds: `FAILSAFE: Brain Heartbeat Lost! Autonomy lease revoked.`
   </Step>

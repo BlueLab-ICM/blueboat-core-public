@@ -1,24 +1,19 @@
-# ROS 2 / colcon build output
+# Ignore compiled ROS 2 files
 build/
 install/
 log/
 
-# Payload repositories, cloned by scripts/sync-payloads.sh
-src/payloads/*
-!src/payloads/.keep
+# Ignore Student Payloads
+src/modules/*
+!src/modules/.keep
 
-# Mission output, when DEPLOY_DATA_ROOT is left inside the repository
-deployment/logs/
-deployment/experiment_logs/
+# Ignore pycache
+src/core/core_autonomy/core_autonomy/__pycache__/
+src/core/core_gateway/core_gateway/__pycache__/
 
-# Python
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.venv/
+*.pyc
 
-# Editors and OS
-.vscode/
-.idea/
-*.swp
-.DS_Store
+*.bak
+
+# Lab-internal vehicle values (sourced by config/vehicle.env)
+config/vehicle.local.env

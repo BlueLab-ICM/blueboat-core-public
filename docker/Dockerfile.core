@@ -1,0 +1,27 @@
+# Helm, fleet link, executive and recording. Applications build on this image.
+FROM ros:jazzy-ros-base
+
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+    python3-pip \
+    docker.io \
+    ros-jazzy-tf2-ros \
+    ros-jazzy-visualization-msgs \
+    ros-jazzy-vision-msgs \
+    ros-jazzy-py-trees \
+    python3-pil \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install psutil --break-system-packages
+
+WORKDIR /app/backseat_ws
+
+COPY src/interfaces/core_interfaces/ src/interfaces/core_interfaces/
+COPY src/core/core_common/ src/core/core_common/
+COPY src/core/core_helm/ src/core/core_helm/
+COPY src/core/core_executive/ src/core/core_executive/
+COPY src/core/core_ops/ src/core/core_ops/
+
+RUN /bin/bash -c "source /opt/ros/jazzy/setup.bash && colcon build"
+
+# ros2 launch and rclpy nodes shut down cleanly on SIGINT.
+STOPSIGNAL SIGINT

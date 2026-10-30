@@ -1,0 +1,12 @@
+# Generic skill call. Every skill module serves this type on /skills/<name>, so a mission
+# tree can run any skill without importing its types. Parameters are JSON, documented in
+# the module's manifest.
+string params_json
+---
+string outcome            # completed | failed | cancelled, or a skill-specific word
+string message
+string result_json
+---
+string state              # loading | ready | running
+string message
+string feedback_json

@@ -1,0 +1,13 @@
+# Limits of the command path. Applications can tighten the speed limits at engagement.
+helm_node:
+  ros__parameters:
+    max_speed_mps: 2.5
+    max_yaw_rate_rps: 2.0
+    # Holds position this long without a fresh command, then ends the engagement.
+    stale_stop_s: 30.0
+    collision_enabled: true
+    safety_radius_m: 10.0
+    horizon_s: 30.0
+    clear_s: 3.0
+    peer_timeout_s: 10.0
+    cruise_speed_mps: 1.0

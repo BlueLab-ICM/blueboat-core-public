@@ -1,0 +1,12 @@
+# Start or end an engagement. Limits of zero keep the helm's configured values.
+bool engage
+string requester
+float64 fence_latitude    # degrees
+float64 fence_longitude   # degrees
+float64 fence_radius_m
+float64 fence_abort_margin_m
+float64 max_speed_mps
+float64 max_yaw_rate_rps
+---
+bool success
+string message

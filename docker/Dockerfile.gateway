@@ -1,0 +1,17 @@
+# Base ROS 2 Image
+FROM ros:jazzy-ros-base
+
+# Install Python tools and pymavlink
+RUN apt-get update && apt-get install -y python3-pip && rm -rf /var/lib/apt/lists/*
+RUN pip3 install pymavlink --break-system-packages
+
+WORKDIR /app/backseat_ws
+
+COPY src/core/core_gateway/ src/core/core_gateway/
+COPY src/core/core_common/ src/core/core_common/
+COPY src/interfaces/core_interfaces/ src/interfaces/core_interfaces/
+
+RUN /bin/bash -c "source /opt/ros/jazzy/setup.bash && colcon build"
+
+# Run the node when the container starts
+CMD ["/bin/bash", "-c", "source /opt/ros/jazzy/setup.bash && source install/setup.bash && exec install/core_gateway/lib/core_gateway/gateway_node"]

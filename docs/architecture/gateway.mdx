@@ -5,7 +5,7 @@ description: "MAVLink translation, authorisation, and the watchdog that revokes 
 
 `gateway_node` is the only node in the system with a MAVLink connection to the autopilot, and the only one that can move the vehicle. Everything else is advisory.
 
-Source: [`src/core/core_gateway/core_gateway/gateway_node.py`](https://github.com/BlueLab-ICM/blueboat-core-public/blob/main/src/core/core_gateway/core_gateway/gateway_node.py)
+Source: [`src/core/core_gateway/core_gateway/gateway_node.py`](https://github.com/BlueLab-ICM/blueboat-core/blob/main/src/core/core_gateway/core_gateway/gateway_node.py)
 
 ## Finding the right autopilot
 
@@ -101,11 +101,9 @@ Every command passes three checks before it becomes MAVLink.
 <Steps>
   <Step title="Is the sender authorised?">
     ```python
-    if msg.source_node != "core_autonomy":
-        self.get_logger().warn(
-            f"SECURITY REJECT: Unauthorized node '{msg.source_node}' "
-            "tried to command the boat!")
-        return
+    # core_gateway/safety.py, AutonomyLease.on_command
+    if source != AUTHORIZED_SOURCE:  # 'core_executive'
+        return False
     ```
 
     ROS 2 topics are visible to every node on the graph, so a payload *can* publish to the command topic. This check is what makes doing so pointless — and loud, since the rejection is logged and recorded in the bag.
@@ -113,8 +111,9 @@ Every command passes three checks before it becomes MAVLink.
 
   <Step title="Is the vehicle in GUIDED?">
     ```python
-    if self._actual_mode_num != _ROVER_MODE['GUIDED']:
-        return
+    # core_gateway/safety.py
+    def is_guided(mode_num: int | None) -> bool:
+        return mode_num == ROVER_MODE['GUIDED']
     ```
 
     The mode comes from `HEARTBEAT` telemetry — read, never written.
@@ -124,12 +123,12 @@ Every command passes three checks before it becomes MAVLink.
 
   <Step title="Is the autonomy alive?">
     ```python
-    if self.autonomy_active and (time.time() - self.last_heartbeat_time > 2.0):
-        self.get_logger().error("FAILSAFE: Brain Heartbeat Lost! ...")
-        self.autonomy_active = False
+    # core_gateway/safety.py, checked before every waypoint and velocity send
+    def allows_send(self, now: float, mode_num: int | None) -> bool:
+        return self.active and not self._is_stale(now) and is_guided(mode_num)  # stale: > 2.0 s
     ```
 
-    The lease is acquired on the first heartbeat received while in GUIDED, renewed by every subsequent one, and revoked after two seconds of silence.
+    The lease is acquired on the first heartbeat received while in GUIDED, renewed by every subsequent one, and revoked after two seconds of silence. Each send also checks staleness, because the watchdog that revokes the lease runs at 1 Hz.
   </Step>
 </Steps>
 

@@ -86,7 +86,7 @@ Every refusal explains itself in the service response. These are the ones you wi
     The file was not found or contained nothing usable. Paths resolve inside the container against `/workspace` — the bind-mounted repository root — so `deployment/waypoints/survey.json` is correct and an absolute host path is not.
 
     ```bash
-    docker exec core_autonomy ls /workspace/deployment/waypoints/
+    docker exec core_executive ls /workspace/deployment/waypoints/
     ```
   </Accordion>
 
@@ -110,7 +110,7 @@ Every refusal explains itself in the service response. These are the ones you wi
     Usually the brain container is still starting — Python imports and DDS discovery take a few seconds after the container reports `Up`.
 
     ```bash
-    docker logs core_autonomy
+    docker logs core_executive
     ```
 
     If the node is genuinely running but the CLI cannot see it, the ros2 daemon is caching a partial graph. Run commands inside the node's own container and always pass `--no-daemon`.
@@ -149,7 +149,7 @@ Every refusal explains itself in the service response. These are the ones you wi
   <Step title="What does the brain think it is doing?">
     ```bash
     ros2 topic echo /system/brain/status
-    ros2 topic echo /system/brain/command
+    ros2 topic echo /helm/output
     ```
 
     `waiting_for_payload` means your payload has gone quiet. `target_rejected` means it is asking for somewhere outside the fence.
@@ -178,8 +178,8 @@ Every refusal explains itself in the service response. These are the ones you wi
     The brain crashed, stalled, or was starved of CPU.
 
     ```bash
-    docker logs core_autonomy | tail -50
-    ros2 topic echo /system/container_stats
+    docker logs core_executive | tail -50
+    ros2 topic echo /ops/container_stats
     ```
 
     A payload consuming the whole CPU can starve the executor. The `restart: no` policy is deliberate: a crashed brain stays down so the failure is unambiguous rather than silently bouncing.
@@ -255,9 +255,9 @@ Every refusal explains itself in the service response. These are the ones you wi
 ```bash
 docker ps
 docker logs core_gateway  | tail -30
-docker logs core_autonomy | tail -30
+docker logs core_executive | tail -30
 
-docker exec -it core_autonomy bash
+docker exec -it core_executive bash
 source /opt/ros/jazzy/setup.bash
 ros2 topic list
 ros2 topic hz /frontseat/gps          # is telemetry flowing at all?
@@ -268,4 +268,4 @@ pytest tests/                          # configuration sanity, before the dock
 
 ## Getting help
 
-Open an issue on [GitHub](https://github.com/BlueLab-ICM/blueboat-core-public/issues) with what you ran, what happened, `docker logs` from both `core_gateway` and `core_autonomy`, and the output of `ros2 param list /brain_node`.
+Open an issue on [GitHub](https://github.com/BlueLab-ICM/blueboat-core/issues) with what you ran, what happened, `docker logs` from both `core_gateway` and `core_executive`, and the output of `ros2 param list /brain_node`.

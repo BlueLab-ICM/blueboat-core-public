@@ -1,34 +1,45 @@
 name: CI
 
-on:
-  push:
-    branches: [ main ]
-  pull_request:
+# Every branch, not just main: the point is to find out before the merge.
+on: push
 
 jobs:
-  tests:
-    name: Geometry and waypoint tests
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches the Jetson host; containers run 3.12.
+          python-version: "3.10"
+
+      # The same hooks, at the same versions, as a commit on a laptop.
+      - run: pip install pre-commit==4.6.2
+      - run: pre-commit run --all-files --show-diff-on-failure
+
+  # The pre-commit hook sees only staged changes and can be skipped, so scan
+  # every commit here. Config and exceptions: .gitleaks.toml, .gitleaksignore.
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: >-
+          docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/repo" -w /repo
+          ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+          git . --redact --verbose
+
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-      - run: pip install pytest
-      # These need no ROS: the geodetic helpers live in a ROS-free module and
-      # the waypoint generator is standard library only. That is deliberate —
-      # the geometry the geofence depends on should be checkable anywhere.
-      - run: pytest tests/ -v
-
-  build:
-    name: Build ${{ matrix.service }} image
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        service: [ gateway, brain, foxglove ]
-    steps:
-      - uses: actions/checkout@v4
-      - run: |
-          docker build -f deployment/Dockerfile.${{ matrix.service }} \
-            -t blueboat-${{ matrix.service }}:ci .
+          python-version: "3.10"
+      # py_trees for the executive's tree tests: the same release as ros-jazzy-py-trees.
+      - run: pip install pytest pyyaml py_trees==2.6.0
+      # Everything except the e2e suite, which needs a running stack. Named as a
+      # directory so a new test file is picked up without editing this workflow.
+      - run: pytest tests/ --ignore=tests/e2e_full_pipeline -q
